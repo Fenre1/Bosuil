@@ -416,7 +416,11 @@ class ScanPipeline:
         return display_metadata
 
     def _embed_records(self, records: list[dict[str, object]]) -> None:
-        ollama = OllamaClient(self.config.ollama_base_url, timeout=self.config.ollama_timeout_seconds)
+        ollama = OllamaClient(
+            self.config.ollama_base_url,
+            timeout=self.config.ollama_timeout_seconds,
+            allow_remote=self.config.ollama_allow_remote,
+        )
         cache = EmbeddingCache(self.db, ollama, self.config.ollama_embed_model)
         texts = [str(record.get("searchable_text") or record["chunk_text"]) for record in records]
         vectors = cache.embed_texts(texts)

@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import QObject, Qt, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import QTextDocument
 from PyQt5.QtPrintSupport import QPrinter
 from PyQt5.QtWidgets import (
@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QMessageBox,
     QPushButton,
     QComboBox,
@@ -35,11 +36,17 @@ from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
 from investigation_rag.retrieval.ranking import SearchResult
-from investigation_rag.rag.strict_answering import StrictAnswerer
+from investigation_rag.rag.strict_answering import (
+    ANSWER_STYLE_BOTH,
+    ANSWER_STYLE_LENIENT,
+    ANSWER_STYLE_STRICT,
+    StrictAnswerer,
+)
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
 
 
 CITATION_REF_RE = re.compile(r"\[(\d+)\]")
+DEFAULT_ANSWER_MODEL = "qwen3.6:latest"
 
 
 @dataclass
@@ -48,8 +55,68 @@ class ChatExchange:
     answer: str
     results: list[SearchResult]
     retrieval_query: str
+    answer_style: str = ANSWER_STYLE_STRICT
     evidence_ledger: list[dict[str, object]] | None = None
     process_feedback: list[str] | None = None
+
+
+class SubmitTextEdit(QTextEdit):
+    submitted = pyqtSignal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
+            event.accept()
+            self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class OllamaModelsWorker(QObject):
+    finished = pyqtSignal(list, str)
+
+    def __init__(self, base_url: str, timeout: int, allow_remote: bool):
+        super().__init__()
+        self.base_url = base_url
+        self.timeout = timeout
+        self.allow_remote = allow_remote
+
+    def run(self) -> None:
+        try:
+            client = OllamaClient(self.base_url, timeout=self.timeout, allow_remote=self.allow_remote)
+            models = client.list_models()
+        except Exception as exc:
+            self.finished.emit([], str(exc))
+            return
+
+        answer_models = []
+        capability_errors = 0
+        for model in models:
+            model_name = str(model.get("name") or model.get("model") or "").strip()
+            if not model_name:
+                continue
+            model_details = dict(model)
+            try:
+                show_payload = client.show_model(model_name)
+            except Exception:
+                capability_errors += 1
+                show_payload = {}
+
+            capabilities = show_payload.get("capabilities")
+            if isinstance(capabilities, list):
+                model_details["capabilities"] = capabilities
+                if not answer_model_is_usable(model_details):
+                    continue
+            answer_models.append(model_details)
+
+        if capability_errors and answer_models:
+            status = f"Loaded {len(answer_models)} answer model(s); some capabilities could not be verified."
+        elif capability_errors:
+            status = "Loaded models, but capabilities could not be verified."
+        elif answer_models:
+            status = f"Loaded {len(answer_models)} answer model(s)."
+        else:
+            status = "No answer-capable Ollama models found."
+        self.finished.emit(answer_models, status)
 
 
 class RagPanel(QWidget):
@@ -64,34 +131,66 @@ class RagPanel(QWidget):
         self.turns: list[ChatExchange] = []
         self.active_turn_index: int | None = None
         self._ledger_progress_lines: list[str] = []
+        self._is_busy = False
+        self.model_thread: QThread | None = None
+        self.model_worker: OllamaModelsWorker | None = None
 
-        self.question_edit = QTextEdit()
-        self.question_edit.setFixedHeight(90)
-        ask_button = QPushButton("Ask")
-        ask_button.clicked.connect(self.ask)
+        self.question_edit = SubmitTextEdit()
+        self.question_edit.setObjectName("Composer")
+        self.question_edit.setFixedHeight(96)
+        self.question_edit.setPlaceholderText("Ask a question")
+        self.question_edit.submitted.connect(self.ask)
+        self.question_edit.textChanged.connect(self.update_ask_button_state)
+        self.ask_button = QPushButton("Ask")
+        self.ask_button.setObjectName("PrimaryButton")
+        self.ask_button.setMinimumWidth(96)
+        self.ask_button.setMinimumHeight(38)
+        self.ask_button.clicked.connect(self.ask)
         new_button = QPushButton("New conversation")
+        new_button.setObjectName("GhostButton")
         new_button.clicked.connect(self.new_conversation)
         save_button = QPushButton("Save to PDF")
+        save_button.setObjectName("GhostButton")
         save_button.clicked.connect(self.save_conversation_pdf)
         self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(190)
         self.profile_combo.addItem("Standard retrieval", "standard")
         self.profile_combo.addItem("Deep retrieval", "deep")
         self.profile_combo.addItem("Evidence ledger RAG", "ledger")
         self.profile_combo.addItem("Legacy retrieval", "legacy")
+        self.answer_style_combo = QComboBox()
+        self.answer_style_combo.setMinimumWidth(150)
+        self.answer_style_combo.addItem("Strict answer", ANSWER_STYLE_STRICT)
+        self.answer_style_combo.addItem("Lenient answer", ANSWER_STYLE_LENIENT)
+        self.answer_style_combo.addItem("Both answers", ANSWER_STYLE_BOTH)
+        self.answer_model_combo = QComboBox()
+        self.answer_model_combo.setMinimumWidth(260)
+        self.answer_model_combo.addItem(DEFAULT_ANSWER_MODEL, DEFAULT_ANSWER_MODEL)
+        if self.config.ollama_llm_model and self.config.ollama_llm_model != DEFAULT_ANSWER_MODEL:
+            self.answer_model_combo.addItem(f"{self.config.ollama_llm_model} (.env)", self.config.ollama_llm_model)
+        self.model_status_label = QLabel("Loading Ollama models...")
+        self.model_status_label.setObjectName("StatusLabel")
+        self.refresh_models_button = QPushButton("Refresh models")
+        self.refresh_models_button.setObjectName("GhostButton")
+        self.refresh_models_button.clicked.connect(self.refresh_answer_models)
 
-        open_button = QPushButton("Open file")
-        open_button.clicked.connect(self.open_selected_file)
-        folder_button = QPushButton("Open folder")
-        folder_button.clicked.connect(self.open_selected_folder)
+        self.open_button = QPushButton("Open file")
+        self.open_button.setObjectName("GhostButton")
+        self.open_button.clicked.connect(self.open_selected_file)
+        self.folder_button = QPushButton("Open folder")
+        self.folder_button.setObjectName("GhostButton")
+        self.folder_button.clicked.connect(self.open_selected_folder)
 
         self.answer_view = QTextBrowser()
         self.answer_view.setReadOnly(True)
+        self.answer_view.setPlaceholderText("Ask a question to start a conversation")
         self.answer_view.setOpenExternalLinks(False)
         self.answer_view.setOpenLinks(False)
         self.answer_view.anchorClicked.connect(self.handle_answer_link)
 
         self.citation_table = QTableWidget(0, 4)
         self.citation_table.setHorizontalHeaderLabels(["#", "Source", "Location", "Path"])
+        self.citation_table.setAlternatingRowColors(True)
         self.citation_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.citation_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.citation_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -100,10 +199,12 @@ class RagPanel(QWidget):
 
         self.chunk_preview = QTextEdit()
         self.chunk_preview.setReadOnly(True)
+        self.chunk_preview.setPlaceholderText("Select a citation to preview the source text")
 
         citation_buttons = QHBoxLayout()
-        citation_buttons.addWidget(open_button)
-        citation_buttons.addWidget(folder_button)
+        citation_buttons.setSpacing(8)
+        citation_buttons.addWidget(self.open_button)
+        citation_buttons.addWidget(self.folder_button)
         citation_buttons.addStretch(1)
 
         citation_splitter = QSplitter()
@@ -125,16 +226,33 @@ class RagPanel(QWidget):
         result_splitter.setStretchFactor(1, 2)
 
         controls = QHBoxLayout()
+        controls.setSpacing(8)
         controls.addWidget(new_button)
         controls.addWidget(save_button)
-        controls.addWidget(self.profile_combo)
         controls.addStretch(1)
-        controls.addWidget(ask_button)
+        controls.addWidget(self.profile_combo)
+        controls.addWidget(self.answer_style_combo)
+        controls.addWidget(self.answer_model_combo)
+        controls.addWidget(self.refresh_models_button)
+
+        composer = QWidget()
+        composer.setObjectName("ComposerBar")
+        composer_layout = QHBoxLayout(composer)
+        composer_layout.setContentsMargins(0, 12, 0, 0)
+        composer_layout.setSpacing(10)
+        composer_layout.addWidget(self.question_edit, 1)
+        composer_layout.addWidget(self.ask_button, 0, Qt.AlignBottom)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(result_splitter, 1)
-        layout.addWidget(self.question_edit)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
         layout.addLayout(controls)
+        layout.addWidget(self.model_status_label)
+        layout.addWidget(result_splitter, 1)
+        layout.addWidget(composer)
+        self.update_ask_button_state()
+        self.update_citation_action_buttons()
+        self.refresh_answer_models()
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         self.investigation_id = investigation_id
@@ -148,20 +266,49 @@ class RagPanel(QWidget):
         self.citation_table.setRowCount(0)
         self.chunk_preview.clear()
         self.question_edit.clear()
+        self.update_ask_button_state()
+        self.update_citation_action_buttons()
+
+    def update_ask_button_state(self) -> None:
+        can_configure = not self._is_busy
+        can_ask = can_configure and self.investigation_id is not None
+        self.question_edit.setEnabled(can_ask)
+        self.profile_combo.setEnabled(can_configure)
+        self.answer_style_combo.setEnabled(can_configure)
+        self.answer_model_combo.setEnabled(can_configure)
+        self.refresh_models_button.setEnabled(can_configure)
+        self.ask_button.setEnabled(can_ask and bool(self.question_edit.toPlainText().strip()))
+
+    def set_busy(self, is_busy: bool) -> None:
+        self._is_busy = is_busy
+        self.ask_button.setText("Working..." if is_busy else "Ask")
+        self.update_ask_button_state()
+
+    def update_citation_action_buttons(self) -> None:
+        has_selection = self.selected_result() is not None
+        self.open_button.setEnabled(has_selection)
+        self.folder_button.setEnabled(has_selection)
 
     def ask(self) -> None:
         if self.investigation_id is None:
             return
         question = self.question_edit.toPlainText().strip()
         if not question:
+            self.question_edit.setFocus()
             return
         history = [ConversationTurn(turn.question, turn.answer) for turn in self.turns]
+        self.set_busy(True)
         try:
             llm = OllamaLLM(
-                OllamaClient(self.config.ollama_base_url, timeout=self.config.ollama_timeout_seconds),
-                self.config.ollama_llm_model,
+                OllamaClient(
+                    self.config.ollama_base_url,
+                    timeout=self.config.ollama_timeout_seconds,
+                    allow_remote=self.config.ollama_allow_remote,
+                ),
+                self.selected_answer_model(),
             )
             profile_name = str(self.profile_combo.currentData())
+            answer_style = self.selected_answer_style()
             searcher_profile = "standard" if profile_name == "ledger" else profile_name
             searcher = build_rag_searcher(self.config, self.db, searcher_profile, llm)
             answerer = StrictAnswerer(searcher, llm)
@@ -174,18 +321,28 @@ class RagPanel(QWidget):
                     history=history,
                     folder_paths=folder_paths,
                     progress_callback=self.show_ledger_progress,
+                    answer_style=answer_style,
                 )
             else:
-                response = answerer.answer(self.investigation_id, question, history=history, folder_paths=folder_paths)
+                response = answerer.answer(
+                    self.investigation_id,
+                    question,
+                    history=history,
+                    folder_paths=folder_paths,
+                    answer_style=answer_style,
+                )
         except Exception as exc:
             QMessageBox.critical(self, "RAG", str(exc))
             return
+        finally:
+            self.set_busy(False)
         self.turns.append(
             ChatExchange(
                 question=question,
                 answer=response.answer,
                 results=response.results,
                 retrieval_query=response.retrieval_query,
+                answer_style=response.answer_style,
                 evidence_ledger=response.evidence_ledger,
                 process_feedback=response.process_feedback,
             )
@@ -196,6 +353,86 @@ class RagPanel(QWidget):
         self.answer_view.verticalScrollBar().setValue(self.answer_view.verticalScrollBar().maximum())
         self.populate_citations()
         self.question_edit.clear()
+
+    def selected_answer_model(self) -> str:
+        data = self.answer_model_combo.currentData()
+        if data:
+            return str(data)
+        text = self.answer_model_combo.currentText().strip()
+        if text:
+            return text
+        return self.config.ollama_llm_model or DEFAULT_ANSWER_MODEL
+
+    def selected_answer_style(self) -> str:
+        data = self.answer_style_combo.currentData()
+        if data:
+            return str(data)
+        return ANSWER_STYLE_STRICT
+
+    def refresh_answer_models(self) -> None:
+        if self.model_thread is not None:
+            return
+        self.model_status_label.setText("Loading Ollama models...")
+        self.refresh_models_button.setEnabled(False)
+        thread = QThread(self)
+        worker = OllamaModelsWorker(
+            self.config.ollama_base_url,
+            timeout=min(max(self.config.ollama_timeout_seconds, 1), 15),
+            allow_remote=self.config.ollama_allow_remote,
+        )
+        self.model_thread = thread
+        self.model_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.apply_answer_models)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self.answer_model_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def answer_model_thread_finished(self) -> None:
+        self.model_thread = None
+        self.model_worker = None
+        self.update_ask_button_state()
+
+    def apply_answer_models(self, models: list[dict[str, object]], status: str) -> None:
+        previous_model = self.selected_answer_model()
+        self.answer_model_combo.blockSignals(True)
+        self.answer_model_combo.clear()
+        answer_models = [model for model in models if answer_model_is_usable(model)]
+        for model in sorted(answer_models, key=lambda item: str(item.get("name") or item.get("model") or "").casefold()):
+            model_name = str(model.get("name") or model.get("model") or "").strip()
+            if not model_name:
+                continue
+            self.answer_model_combo.addItem(answer_model_label(model), model_name)
+
+        if self.answer_model_combo.count() == 0:
+            fallback_model = self.config.ollama_llm_model or DEFAULT_ANSWER_MODEL
+            self.answer_model_combo.addItem(f"{fallback_model} (fallback)", fallback_model)
+
+        self.select_answer_model(DEFAULT_ANSWER_MODEL)
+        if self.answer_model_combo.currentData() != DEFAULT_ANSWER_MODEL:
+            self.select_answer_model(self.config.ollama_llm_model)
+        if self.answer_model_combo.currentData() not in {DEFAULT_ANSWER_MODEL, self.config.ollama_llm_model}:
+            self.select_answer_model(previous_model)
+        self.answer_model_combo.blockSignals(False)
+        self.model_status_label.setText(status)
+        self.update_ask_button_state()
+
+    def select_answer_model(self, model_name: str) -> None:
+        if not model_name:
+            return
+        for index in range(self.answer_model_combo.count()):
+            if self.answer_model_combo.itemData(index) == model_name:
+                self.answer_model_combo.setCurrentIndex(index)
+                return
+
+    def shutdown(self, wait_ms: int = 3000) -> None:
+        if self.model_thread is None or not self.model_thread.isRunning():
+            return
+        self.model_thread.quit()
+        self.model_thread.wait(wait_ms)
 
     def show_ledger_progress(self, message: str) -> None:
         self._ledger_progress_lines.append(message)
@@ -428,6 +665,7 @@ class RagPanel(QWidget):
             self.citation_table.selectRow(select_row)
         else:
             self.chunk_preview.clear()
+        self.update_citation_action_buttons()
 
     def selected_result(self) -> SearchResult | None:
         row = self.citation_table.currentRow()
@@ -451,6 +689,7 @@ class RagPanel(QWidget):
 
     def update_chunk_preview(self) -> None:
         result = self.selected_result()
+        self.update_citation_action_buttons()
         if result is None:
             self.chunk_preview.clear()
             return
@@ -519,3 +758,25 @@ class RagPanel(QWidget):
         if result.page_number:
             return f"page {result.page_number}"
         return f"chunk {result.chunk_index + 1}"
+
+
+def answer_model_label(model: dict[str, object]) -> str:
+    name = str(model.get("name") or model.get("model") or "").strip()
+    details = model.get("details")
+    parts = []
+    if isinstance(details, dict):
+        parameter_size = details.get("parameter_size")
+        quantization = details.get("quantization_level")
+        if parameter_size:
+            parts.append(str(parameter_size))
+        if quantization:
+            parts.append(str(quantization))
+    return f"{name} ({', '.join(parts)})" if parts else name
+
+
+def answer_model_is_usable(model: dict[str, object]) -> bool:
+    capabilities = model.get("capabilities")
+    if not isinstance(capabilities, list):
+        return True
+    capability_names = {str(capability).casefold() for capability in capabilities}
+    return "completion" in capability_names

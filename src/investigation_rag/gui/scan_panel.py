@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from PyQt5.QtCore import QObject, QThread, pyqtSignal
-from PyQt5.QtWidgets import QHBoxLayout, QPushButton, QTextEdit, QVBoxLayout, QWidget
+from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import QLabel, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget
 
 from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
+from investigation_rag.gui.disappeared_files_panel import DisappearedFilesPanel
 from investigation_rag.ingest.pipeline import ScanPipeline
 
 
@@ -38,23 +39,68 @@ class ScanPanel(QWidget):
         self.investigation_id: int | None = None
         self.thread: QThread | None = None
         self.worker: ScanWorker | None = None
+        self.investigation_selector: QWidget | None = None
 
         self.scan_button = QPushButton("Scan investigation")
-        self.scan_button.clicked.connect(self.start_scan)
+        self.scan_button.setObjectName("PrimaryButton")
+        self.scan_button.setEnabled(False)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("Scan activity will appear here")
+        self.disappeared_panel = DisappearedFilesPanel(db)
 
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.scan_button)
-        buttons.addStretch(1)
+        scan_log_label = QLabel(" Scan log")
+        scan_log_label.setObjectName("FieldLabel")
+        disappeared_label = QLabel("Disappeared files")
+        disappeared_label.setObjectName("FieldLabel")
+
+        scan_log_container = QWidget()
+        scan_log_layout = QVBoxLayout(scan_log_container)
+        scan_log_layout.setContentsMargins(0, 0, 0, 0)
+        scan_log_layout.setSpacing(8)
+        scan_log_layout.addWidget(scan_log_label)
+        scan_log_layout.addWidget(self.log_view, 1)
+
+        disappeared_container = QWidget()
+        disappeared_layout = QVBoxLayout(disappeared_container)
+        disappeared_layout.setContentsMargins(0, 0, 0, 0)
+        disappeared_layout.setSpacing(8)
+        disappeared_layout.addWidget(disappeared_label)
+        disappeared_layout.addWidget(self.disappeared_panel, 1)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(scan_log_container)
+        splitter.addWidget(disappeared_container)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
+        self.content_container = QWidget()
+        content_layout = QVBoxLayout(self.content_container)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
+        content_layout.addWidget(splitter, 1)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.addWidget(self.content_container)
+        self.main_splitter.setStretchFactor(0, 1)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(buttons)
-        layout.addWidget(self.log_view, 1)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
+        layout.addWidget(self.main_splitter, 1)
+
+    def set_investigation_selector(self, widget: QWidget) -> None:
+        self.investigation_selector = widget
+        widget.setMinimumWidth(320)
+        self.main_splitter.insertWidget(0, widget)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([360, 900])
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         self.investigation_id = investigation_id
         self.scan_button.setEnabled(investigation_id is not None)
+        self.disappeared_panel.set_investigation_id(investigation_id)
 
     def start_scan(self) -> None:
         if self.investigation_id is None or self.thread is not None:
@@ -78,11 +124,12 @@ class ScanPanel(QWidget):
     def scan_finished(self, message: str) -> None:
         if message:
             self.log_view.append(message)
- 
+
     def scan_thread_finished(self) -> None:
         self.thread = None
         self.worker = None
         self.scan_button.setEnabled(self.investigation_id is not None)
+        self.disappeared_panel.refresh()
 
     def shutdown(self, wait_ms: int = 5000) -> None:
         if self.thread is None or not self.thread.isRunning():

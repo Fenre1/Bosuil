@@ -11,6 +11,7 @@ def app_config(tmp_path: Path) -> AppConfig:
         sqlite_path=tmp_path / "app.sqlite3",
         lancedb_dir=tmp_path / "lancedb",
         ollama_base_url="http://127.0.0.1:11434",
+        ollama_allow_remote=False,
         ollama_timeout_seconds=120,
         ollama_llm_model="",
         ollama_embed_model="",

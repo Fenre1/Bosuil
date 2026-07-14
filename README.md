@@ -27,6 +27,7 @@ Then edit `.env`:
 ```env
 INVESTIGATION_RAG_DATA_DIR=C:\InvestigationRAGData
 OLLAMA_BASE_URL=http://127.0.0.1:11434
+INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0
 OLLAMA_TIMEOUT_SECONDS=120
 OLLAMA_LLM_MODEL=<your-local-chat-model>
 OLLAMA_EMBED_MODEL=<your-local-embedding-model>
@@ -34,6 +35,8 @@ OLLAMA_EMBED_QUERY_INSTRUCTION=Given a user question, retrieve relevant passages
 ```
 
 By default data is stored under `%LOCALAPPDATA%\InvestigationRAG`. Real environment variables still take priority over values in `.env`, so temporary PowerShell overrides continue to work. If you keep the file somewhere else, set `INVESTIGATION_RAG_ENV_FILE` to that path before running the app.
+
+The app rejects non-loopback Ollama URLs by default and the Ollama client ignores proxy environment variables. Keep `INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0` for sensitive data. Only set it to `1` for a trusted non-sensitive setup where the Ollama server is intentionally hosted away from the same machine.
 
 For slower local models or long evidence-ledger RAG runs, raise `OLLAMA_TIMEOUT_SECONDS` in `.env`; for example, `600` waits up to ten minutes for each local Ollama request.
 

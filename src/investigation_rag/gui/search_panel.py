@@ -10,10 +10,12 @@ from typing import Any
 from PyQt5.QtCore import QModelIndex, Qt
 from PyQt5.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QButtonGroup,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -51,25 +53,37 @@ class SearchPanel(QWidget):
         self.results: list[SearchResult] = []
 
         self.query_edit = QLineEdit()
+        self.query_edit.setPlaceholderText("Search documents")
+        self.query_edit.setClearButtonEnabled(True)
+        self.query_edit.returnPressed.connect(self.run_search)
+        self.query_edit.textChanged.connect(self.update_search_button_state)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["keyword", "semantic", "hybrid"])
-        search_button = QPushButton("Search")
-        search_button.clicked.connect(self.run_search)
-        open_button = QPushButton("Open file")
-        open_button.clicked.connect(self.open_selected_file)
-        folder_button = QPushButton("Open folder")
-        folder_button.clicked.connect(self.open_selected_folder)
+        self.search_button = QPushButton("Search")
+        self.search_button.setObjectName("PrimaryButton")
+        self.search_button.clicked.connect(self.run_search)
+        self.open_button = QPushButton("Open file")
+        self.open_button.setObjectName("GhostButton")
+        self.open_button.clicked.connect(self.open_selected_file)
+        self.folder_button = QPushButton("Open folder")
+        self.folder_button.setObjectName("GhostButton")
+        self.folder_button.clicked.connect(self.open_selected_folder)
+        self.status_label = QLabel()
+        self.status_label.setObjectName("StatusLabel")
 
         top = QHBoxLayout()
+        top.setSpacing(8)
         top.addWidget(self.query_edit, 1)
         top.addWidget(self.mode_combo)
-        top.addWidget(search_button)
-        top.addWidget(open_button)
-        top.addWidget(folder_button)
+        top.addWidget(self.search_button)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Score", "Filename", "Path", "Type"])
         self.table.setItemDelegate(SearchResultDelegate(self.table))
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.itemSelectionChanged.connect(self.update_preview)
 
@@ -77,6 +91,7 @@ class SearchPanel(QWidget):
         self.tree.setHeaderLabels(["Document / result", "Score", "Location", "Type"])
         self.tree.itemSelectionChanged.connect(self.update_preview)
         self.tree.setItemDelegate(SearchResultDelegate(self.tree))
+        self.tree.setAlternatingRowColors(True)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
 
         self.result_stack = QStackedWidget()
@@ -86,9 +101,13 @@ class SearchPanel(QWidget):
         list_button = QPushButton("List")
         list_button.setCheckable(True)
         list_button.setChecked(True)
+        list_button.setProperty("segment", True)
+        list_button.setProperty("segmentPosition", "left")
         list_button.clicked.connect(lambda: self.set_result_view(0))
         hierarchy_button = QPushButton("Hierarchy")
         hierarchy_button.setCheckable(True)
+        hierarchy_button.setProperty("segment", True)
+        hierarchy_button.setProperty("segmentPosition", "right")
         hierarchy_button.clicked.connect(lambda: self.set_result_view(1))
         self.view_button_group = QButtonGroup(self)
         self.view_button_group.setExclusive(True)
@@ -96,14 +115,21 @@ class SearchPanel(QWidget):
         self.view_button_group.addButton(hierarchy_button)
 
         view_controls = QHBoxLayout()
+        view_controls.setSpacing(8)
         view_controls.addWidget(list_button)
         view_controls.addWidget(hierarchy_button)
+        view_controls.addSpacing(12)
+        view_controls.addWidget(self.status_label)
         view_controls.addStretch(1)
+        view_controls.addWidget(self.open_button)
+        view_controls.addWidget(self.folder_button)
 
         self.metadata_view = QTextEdit()
         self.metadata_view.setReadOnly(True)
+        self.metadata_view.setPlaceholderText("Select a result to view metadata")
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("Select a result to preview matching text")
 
         preview_splitter = QSplitter(Qt.Vertical)
         preview_splitter.addWidget(self.metadata_view)
@@ -124,8 +150,13 @@ class SearchPanel(QWidget):
         splitter.setStretchFactor(1, 3)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
         layout.addLayout(top)
         layout.addWidget(splitter, 1)
+        self.update_search_button_state()
+        self.update_action_buttons()
+        self.update_status()
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         self.investigation_id = investigation_id
@@ -134,6 +165,9 @@ class SearchPanel(QWidget):
         self.tree.clear()
         self.metadata_view.clear()
         self.preview.clear()
+        self.update_search_button_state()
+        self.update_action_buttons()
+        self.update_status()
 
     def run_search(self) -> None:
         if self.investigation_id is None:
@@ -151,6 +185,26 @@ class SearchPanel(QWidget):
             return
         self.populate_table()
         self.populate_tree()
+        self.update_status()
+        self.update_action_buttons()
+
+    def update_search_button_state(self) -> None:
+        self.search_button.setEnabled(self.investigation_id is not None and bool(self.query_edit.text().strip()))
+
+    def update_action_buttons(self) -> None:
+        has_selection = self.selected_result() is not None
+        self.open_button.setEnabled(has_selection)
+        self.folder_button.setEnabled(has_selection)
+
+    def update_status(self) -> None:
+        if self.investigation_id is None:
+            self.status_label.setText("No investigation")
+        elif not self.results:
+            self.status_label.setText("No results")
+        elif len(self.results) == 1:
+            self.status_label.setText("1 result")
+        else:
+            self.status_label.setText(f"{len(self.results)} results")
 
     def set_result_view(self, view_index: int) -> None:
         self.result_stack.setCurrentIndex(view_index)
@@ -229,6 +283,7 @@ class SearchPanel(QWidget):
 
     def update_preview(self) -> None:
         result = self.selected_result()
+        self.update_action_buttons()
         if result is None:
             self.metadata_view.clear()
             self.preview.clear()

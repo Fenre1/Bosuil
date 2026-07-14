@@ -13,7 +13,8 @@ def main() -> int:
     except ImportError as exc:
         raise RuntimeError("PyQt5 is required to run the desktop app.") from exc
 
-    from investigation_rag.gui.main_window import MainWindow
+    from investigation_rag.gui.main_window import MainWindow, app_icon
+    from investigation_rag.gui.style import apply_app_style
 
     config = AppConfig.from_env()
     config.ensure_dirs()
@@ -22,6 +23,10 @@ def main() -> int:
     store = LanceDBStore(config.lancedb_dir)
 
     app = QApplication(sys.argv)
+    apply_app_style(app)
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = MainWindow(config, db, store)
     window.resize(1200, 780)
     window.show()

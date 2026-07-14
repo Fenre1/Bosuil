@@ -16,6 +16,16 @@ Every factual claim must be supported by a citation like [1] or [2].
 """
 
 
+LENIENT_SYSTEM_INSTRUCTIONS = """You are a local investigation assistant.
+Use the retrieved context as the main source of evidence, but you may also use careful reasoning, common knowledge, and relevant background knowledge to help answer the user's question.
+Do not pretend that unsupported ideas are proven. Separate what the retrieved evidence says from your interpretation, inference, or suggestion.
+Cite retrieved evidence with [1], [2], etc. when making claims based directly on the retrieved context. General explanation, reasoning, and clearly marked speculation do not need citations.
+Conversation history may be used to understand the user's intent and references. Treat it as context, not as primary evidence.
+If the retrieved context is incomplete, still try to give a useful answer. Say what seems likely, what is uncertain, and what extra evidence would help confirm it.
+Prefer a direct, natural answer. You may synthesize across sources, explain implications, identify patterns, flag contradictions, and suggest next investigative steps.
+"""
+
+
 CONTEXTUAL_QUERY_INSTRUCTIONS = """Rewrite the user's current question as one standalone search query for a local investigation archive.
 Use the recent conversation only to resolve references like "it", "that", "those dates", or "the second one".
 Do not answer the question.
@@ -52,6 +62,14 @@ If the ledger does not contain enough evidence, say: "The evidence ledger is ins
 Every factual claim must cite ledger entries like [E1] or [E2].
 """
 
+
+LENIENT_LEDGER_FINAL_ANSWER_INSTRUCTIONS = """You are answering a local investigation question from an evidence ledger.
+Use the evidence ledger as the factual foundation. You may reason from the ledger, explain implications, identify patterns, and suggest plausible next steps.
+Cite ledger-backed claims with [E1], [E2], etc. Clearly distinguish direct evidence from inference, interpretation, or speculation.
+If the ledger is incomplete, still provide the most useful answer you can. Explain what is uncertain and what additional evidence would help.
+Prefer a direct, readable answer rather than refusing unless there is truly no relevant evidence.
+"""
+
 MAX_HISTORY_TURNS = 6
 MAX_HISTORY_CHARS = 5000
 MAX_HISTORY_QUESTION_CHARS = 1000
@@ -81,6 +99,59 @@ def build_strict_prompt(
     results: list[SearchResult],
     history: list[ConversationTurn] | None = None,
 ) -> str:
+    return build_retrieved_context_prompt(
+        question,
+        results,
+        history=history,
+        instructions=STRICT_SYSTEM_INSTRUCTIONS,
+        answer_label="Answer with citations:",
+        strict_history=True,
+    )
+
+
+def build_lenient_prompt(
+    question: str,
+    results: list[SearchResult],
+    history: list[ConversationTurn] | None = None,
+) -> str:
+    return build_retrieved_context_prompt(
+        question,
+        results,
+        history=history,
+        instructions=LENIENT_SYSTEM_INSTRUCTIONS,
+        answer_label="Answer:",
+        strict_history=False,
+    )
+
+
+def build_retrieved_context_prompt(
+    question: str,
+    results: list[SearchResult],
+    *,
+    history: list[ConversationTurn] | None,
+    instructions: str,
+    answer_label: str,
+    strict_history: bool,
+) -> str:
+    context = format_retrieved_context(results)
+    history_text = format_conversation_history(history or [])
+    history_section = ""
+    if history_text:
+        if strict_history:
+            history_header = "Recent conversation (for resolving references only; do not cite it as evidence):"
+        else:
+            history_header = "Recent conversation (for context and reference resolution; do not cite it as primary evidence):"
+        history_section = f"{history_header}\n{history_text}\n\n"
+    return (
+        f"{instructions}\n"
+        f"{history_section}"
+        f"Retrieved context:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        f"{answer_label}"
+    )
+
+
+def format_retrieved_context(results: list[SearchResult]) -> str:
     context_blocks = []
     for index, result in enumerate(results, start=1):
         metadata = [
@@ -120,21 +191,9 @@ def build_strict_prompt(
             f"Raw chunk text:\n{result.chunk_text}"
         )
 
-    context = "\n\n---\n\n".join(context_blocks)
-    history_text = format_conversation_history(history or [])
-    history_section = ""
-    if history_text:
-        history_section = (
-            "Recent conversation (for resolving references only; do not cite it as evidence):\n"
-            f"{history_text}\n\n"
-        )
-    return (
-        f"{STRICT_SYSTEM_INSTRUCTIONS}\n"
-        f"{history_section}"
-        f"Retrieved context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        "Answer with citations:"
-    )
+    if not context_blocks:
+        return "No retrieved context."
+    return "\n\n---\n\n".join(context_blocks)
 
 
 def build_evidence_ledger_prompt(
@@ -160,14 +219,38 @@ def build_evidence_ledger_prompt(
 
 
 def build_ledger_final_answer_prompt(question: str, ledger: list[dict[str, object]]) -> str:
+    return build_ledger_answer_prompt(
+        question,
+        ledger,
+        instructions=LEDGER_FINAL_ANSWER_INSTRUCTIONS,
+        answer_label="Answer with ledger citations:",
+    )
+
+
+def build_lenient_ledger_final_answer_prompt(question: str, ledger: list[dict[str, object]]) -> str:
+    return build_ledger_answer_prompt(
+        question,
+        ledger,
+        instructions=LENIENT_LEDGER_FINAL_ANSWER_INSTRUCTIONS,
+        answer_label="Answer:",
+    )
+
+
+def build_ledger_answer_prompt(
+    question: str,
+    ledger: list[dict[str, object]],
+    *,
+    instructions: str,
+    answer_label: str,
+) -> str:
     ledger_text = "\n".join(format_ledger_entry(index, entry) for index, entry in enumerate(ledger, start=1))
     if not ledger_text:
         ledger_text = "No ledger entries."
     return (
-        f"{LEDGER_FINAL_ANSWER_INSTRUCTIONS}\n\n"
+        f"{instructions}\n\n"
         f"Evidence ledger:\n{ledger_text}\n\n"
         f"Question: {question}\n\n"
-        "Answer with ledger citations:"
+        f"{answer_label}"
     )
 
 

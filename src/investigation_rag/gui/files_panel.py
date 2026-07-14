@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -21,13 +22,69 @@ from investigation_rag.gui.folder_scope import FolderScopePanel
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
 
 
+@dataclass(frozen=True)
+class FilesLoadResult:
+    request_id: int
+    investigation_id: int
+    roots: list[Path]
+    files: list[dict]
+    chunks: list[dict]
+    error: str = ""
+
+
+@dataclass
+class TreePopulateState:
+    request_id: int
+    roots: list[Path]
+    files: list[dict]
+    chunks_by_file_id: dict[int, list[dict]]
+    root_items: dict[str, QTreeWidgetItem]
+    items_by_path: dict[str, QTreeWidgetItem]
+    next_file_index: int = 0
+
+
+class FilesLoadWorker(QObject):
+    finished = pyqtSignal(object)
+
+    def __init__(self, db: SQLiteDB, investigation_id: int, lazy_load_chunk_text: bool, request_id: int):
+        super().__init__()
+        self.db = db
+        self.investigation_id = investigation_id
+        self.lazy_load_chunk_text = lazy_load_chunk_text
+        self.request_id = request_id
+
+    def run(self) -> None:
+        try:
+            roots = self.db.get_roots(self.investigation_id)
+            files = [dict(row) for row in self.db.active_files_for_investigation(self.investigation_id)]
+            if self.lazy_load_chunk_text:
+                chunks = [dict(row) for row in self.db.active_chunk_summaries_for_investigation(self.investigation_id)]
+            else:
+                chunks = [dict(row) for row in self.db.active_chunks_for_investigation(self.investigation_id)]
+            result = FilesLoadResult(self.request_id, self.investigation_id, roots, files, chunks)
+        except Exception as exc:
+            result = FilesLoadResult(self.request_id, self.investigation_id, [], [], [], str(exc))
+        self.finished.emit(result)
+
+
 class FilesPanel(QWidget):
+    load_started = pyqtSignal(int)
+    load_finished = pyqtSignal(int, str)
+
+    POPULATE_BATCH_SIZE = 120
+
     def __init__(self, db: SQLiteDB, lazy_load_chunk_text: bool = True):
         super().__init__()
         self.db = db
         self.lazy_load_chunk_text = lazy_load_chunk_text
         self.investigation_id: int | None = None
         self.status_label = QLabel()
+        self.status_label.setObjectName("StatusLabel")
+        self.load_thread: QThread | None = None
+        self.load_worker: FilesLoadWorker | None = None
+        self._load_request_id = 0
+        self._reload_pending = False
+        self._populate_state: TreePopulateState | None = None
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["File / chunk", "Type", "Details"])
@@ -36,17 +93,20 @@ class FilesPanel(QWidget):
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
 
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.reload)
-        open_button = QPushButton("Open file")
-        open_button.clicked.connect(self.open_selected_file)
-        folder_button = QPushButton("Open folder")
-        folder_button.clicked.connect(self.open_selected_folder)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.reload)
+        self.open_button = QPushButton("Open file")
+        self.open_button.clicked.connect(self.open_selected_file)
+        self.folder_button = QPushButton("Open folder")
+        self.folder_button.clicked.connect(self.open_selected_folder)
+        self.refresh_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.folder_button.setEnabled(False)
 
         controls = QHBoxLayout()
-        controls.addWidget(refresh_button)
-        controls.addWidget(open_button)
-        controls.addWidget(folder_button)
+        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.open_button)
+        controls.addWidget(self.folder_button)
         controls.addStretch(1)
         controls.addWidget(self.status_label)
 
@@ -65,26 +125,125 @@ class FilesPanel(QWidget):
         self.reload()
 
     def reload(self) -> None:
+        self._load_request_id += 1
+        request_id = self._load_request_id
+        self._populate_state = None
         self.tree.clear()
         self.preview.clear()
         if self.investigation_id is None:
+            self._reload_pending = False
+            self.set_loading(False)
             self.update_status(0, 0)
             return
 
-        roots = self.db.get_roots(self.investigation_id)
-        files = self.db.active_files_for_investigation(self.investigation_id)
-        if self.lazy_load_chunk_text:
-            chunks = self.db.active_chunk_summaries_for_investigation(self.investigation_id)
-        else:
-            chunks = self.db.active_chunks_for_investigation(self.investigation_id)
+        self.set_loading(True, "Loading files and chunks...")
+        self.load_started.emit(self.investigation_id)
+        if self.load_thread is not None:
+            self._reload_pending = True
+            return
+        self.start_load_thread(self.investigation_id, request_id)
+
+    def start_load_thread(self, investigation_id: int, request_id: int) -> None:
+        thread = QThread(self)
+        worker = FilesLoadWorker(self.db, investigation_id, self.lazy_load_chunk_text, request_id)
+        self.load_thread = thread
+        self.load_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.apply_load_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self.load_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def apply_load_result(self, result: FilesLoadResult) -> None:
+        if result.request_id != self._load_request_id or result.investigation_id != self.investigation_id:
+            return
+        if result.error:
+            self.set_loading(False)
+            self.tree.clear()
+            error_item = QTreeWidgetItem(self.tree)
+            error_item.setText(0, "Could not load file list.")
+            error_item.setText(1, "error")
+            self.status_label.setText("Unable to load files")
+            self.load_finished.emit(result.investigation_id, result.error)
+            QMessageBox.warning(self, "Files", result.error)
+            return
+        self.start_tree_population(result)
+
+    def load_thread_finished(self) -> None:
+        self.load_thread = None
+        self.load_worker = None
+        if not self._reload_pending:
+            return
+        self._reload_pending = False
+        if self.investigation_id is None:
+            self.set_loading(False)
+            self.update_status(0, 0)
+            return
+        self.start_load_thread(self.investigation_id, self._load_request_id)
+
+    def start_tree_population(self, result: FilesLoadResult) -> None:
         chunks_by_file_id: dict[int, list] = {}
-        for chunk in chunks:
+        for chunk in result.chunks:
             chunks_by_file_id.setdefault(int(chunk["file_id"]), []).append(chunk)
 
-        self.populate_tree(roots, files, chunks_by_file_id)
+        root_items: dict[str, QTreeWidgetItem] = {}
+        items_by_path: dict[str, QTreeWidgetItem] = {}
+        self.tree.clear()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for root in result.roots:
+                root_key = FolderScopePanel.path_key(root)
+                item = self.add_folder_item(self.tree, root.name or str(root), root)
+                root_items[root_key] = item
+                items_by_path[root_key] = item
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+        files = sorted(result.files, key=lambda row: str(row["normalized_path"]))
+        self._populate_state = TreePopulateState(
+            request_id=result.request_id,
+            roots=result.roots,
+            files=files,
+            chunks_by_file_id=chunks_by_file_id,
+            root_items=root_items,
+            items_by_path=items_by_path,
+        )
+        self.status_label.setText(f"Loading files... 0/{len(files)}")
+        QTimer.singleShot(0, self.populate_next_batch)
+
+    def populate_next_batch(self) -> None:
+        state = self._populate_state
+        if state is None or state.request_id != self._load_request_id:
+            return
+        end_index = min(state.next_file_index + self.POPULATE_BATCH_SIZE, len(state.files))
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for file_row in state.files[state.next_file_index:end_index]:
+                file_path = Path(str(file_row["path"]))
+                parent = self.ensure_folder_item(file_path.parent, state.roots, state.root_items, state.items_by_path)
+                file_item = self.add_file_item(parent, file_row)
+                for chunk in state.chunks_by_file_id.get(int(file_row["id"]), []):
+                    self.add_chunk_item(file_item, chunk)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+        state.next_file_index = end_index
+        self.status_label.setText(f"Loading files... {end_index}/{len(state.files)}")
+        if end_index < len(state.files):
+            QTimer.singleShot(0, self.populate_next_batch)
+            return
+
         self.tree.expandToDepth(0)
         self.tree.resizeColumnToContents(0)
-        self.update_status(len(files), len(chunks))
+        chunk_count = sum(len(chunks) for chunks in state.chunks_by_file_id.values())
+        self._populate_state = None
+        self.set_loading(False)
+        self.update_status(len(state.files), chunk_count)
+        if self.investigation_id is not None:
+            self.load_finished.emit(self.investigation_id, "")
 
     def populate_tree(self, roots: list[Path], files: list, chunks_by_file_id: dict[int, list]) -> None:
         root_items: dict[str, QTreeWidgetItem] = {}
@@ -215,6 +374,32 @@ class FilesPanel(QWidget):
 
     def update_status(self, file_count: int, chunk_count: int) -> None:
         self.status_label.setText(f"{file_count} files, {chunk_count} chunks")
+
+    def set_loading(self, is_loading: bool, message: str = "") -> None:
+        has_investigation = self.investigation_id is not None
+        self.tree.setEnabled(not is_loading)
+        self.preview.setEnabled(not is_loading)
+        self.refresh_button.setEnabled(not is_loading and has_investigation)
+        self.open_button.setEnabled(not is_loading and has_investigation)
+        self.folder_button.setEnabled(not is_loading and has_investigation)
+        if is_loading:
+            self.setCursor(Qt.WaitCursor)
+            self.tree.clear()
+            loading_item = QTreeWidgetItem(self.tree)
+            loading_item.setText(0, message or "Loading files and chunks...")
+            loading_item.setText(1, "loading")
+            self.status_label.setText(message or "Loading files and chunks...")
+        else:
+            self.unsetCursor()
+
+    def shutdown(self, wait_ms: int = 5000) -> None:
+        self._load_request_id += 1
+        self._reload_pending = False
+        self._populate_state = None
+        if self.load_thread is None or not self.load_thread.isRunning():
+            return
+        self.load_thread.quit()
+        self.load_thread.wait(wait_ms)
 
     @staticmethod
     def chunk_location(chunk) -> str:

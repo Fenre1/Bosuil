@@ -39,6 +39,7 @@ class AppConfig:
     sqlite_path: Path
     lancedb_dir: Path
     ollama_base_url: str
+    ollama_allow_remote: bool
     ollama_timeout_seconds: int
     ollama_llm_model: str
     ollama_embed_model: str
@@ -71,6 +72,7 @@ class AppConfig:
             sqlite_path=app_data_dir / "investigations.sqlite3",
             lancedb_dir=app_data_dir / "lancedb",
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
+            ollama_allow_remote=_bool_env("INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA", False),
             ollama_timeout_seconds=_positive_int_env("OLLAMA_TIMEOUT_SECONDS", 120),
             ollama_llm_model=os.getenv("OLLAMA_LLM_MODEL", "").strip(),
             ollama_embed_model=os.getenv("OLLAMA_EMBED_MODEL", "").strip(),

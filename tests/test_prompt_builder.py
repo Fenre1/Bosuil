@@ -1,6 +1,8 @@
 from investigation_rag.rag.prompt_builder import (
     ConversationTurn,
     build_contextual_query_prompt,
+    build_lenient_ledger_final_answer_prompt,
+    build_lenient_prompt,
     build_strict_prompt,
 )
 from investigation_rag.retrieval.ranking import SearchResult
@@ -46,6 +48,45 @@ def test_strict_prompt_includes_history_as_non_evidence():
     assert "User: Who sent the payment email?" in prompt
     assert "Assistant: Alice sent the payment email [1]." in prompt
     assert "Conversation history may be used only to understand references" in prompt
+
+
+def test_lenient_prompt_allows_reasoning_while_preserving_context_citations():
+    result = SearchResult(
+        chunk_id="c1",
+        investigation_id=1,
+        file_id=1,
+        path="C:/case/report.pdf",
+        chunk_text="The payment was received on 5 May.",
+        source_type="pdf",
+        chunk_index=0,
+        page_number=3,
+        score=1.0,
+    )
+
+    prompt = build_lenient_prompt("What does this suggest?", [result])
+
+    assert "common knowledge" in prompt
+    assert "clearly marked speculation" in prompt
+    assert "C:/case/report.pdf (page 3)" in prompt
+    assert "Do not use general world knowledge" not in prompt
+
+
+def test_lenient_ledger_final_prompt_uses_ledger_as_foundation():
+    ledger = [
+        {
+            "claim": "The payment was received on 5 May.",
+            "source_chunk_id": "c1",
+            "support_type": "supports",
+            "confidence": "high",
+        }
+    ]
+
+    prompt = build_lenient_ledger_final_answer_prompt("What does this suggest?", ledger)
+
+    assert "Use the evidence ledger as the factual foundation" in prompt
+    assert "You may reason from the ledger" in prompt
+    assert "[E1] The payment was received on 5 May." in prompt
+    assert "Raw chunk text" not in prompt
 
 
 def test_contextual_query_prompt_requests_standalone_search_query():

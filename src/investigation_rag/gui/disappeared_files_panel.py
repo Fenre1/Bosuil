@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -22,29 +23,42 @@ class DisappearedFilesPanel(QWidget):
         self.investigation_id: int | None = None
         self.disappeared_ids: list[int] = []
 
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh)
-        inactive = QPushButton("Mark inactive")
-        inactive.clicked.connect(lambda: self.apply_action("inactive"))
-        keep = QPushButton("Keep active")
-        keep.clicked.connect(lambda: self.apply_action("keep"))
-        update_path = QPushButton("Update path")
-        update_path.clicked.connect(self.update_path)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setObjectName("GhostButton")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.inactive_button = QPushButton("Mark inactive")
+        self.inactive_button.setObjectName("GhostButton")
+        self.inactive_button.clicked.connect(lambda: self.apply_action("inactive"))
+        self.keep_button = QPushButton("Keep active")
+        self.keep_button.setObjectName("GhostButton")
+        self.keep_button.clicked.connect(lambda: self.apply_action("keep"))
+        self.update_path_button = QPushButton("Update path")
+        self.update_path_button.setObjectName("GhostButton")
+        self.update_path_button.clicked.connect(self.update_path)
 
         buttons = QHBoxLayout()
-        buttons.addWidget(refresh)
-        buttons.addWidget(inactive)
-        buttons.addWidget(keep)
-        buttons.addWidget(update_path)
+        buttons.setSpacing(8)
+        buttons.addWidget(self.refresh_button)
+        buttons.addWidget(self.inactive_button)
+        buttons.addWidget(self.keep_button)
+        buttons.addWidget(self.update_path_button)
         buttons.addStretch(1)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Path", "Last seen", "Chunks", "Status"])
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.itemSelectionChanged.connect(self.update_action_buttons)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         layout.addLayout(buttons)
         layout.addWidget(self.table, 1)
+        self.update_action_buttons()
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         self.investigation_id = investigation_id
@@ -54,6 +68,7 @@ class DisappearedFilesPanel(QWidget):
         self.table.setRowCount(0)
         self.disappeared_ids = []
         if self.investigation_id is None:
+            self.update_action_buttons()
             return
         rows = self.db.list_disappeared_files(self.investigation_id, status="pending")
         self.table.setRowCount(len(rows))
@@ -63,6 +78,15 @@ class DisappearedFilesPanel(QWidget):
             self.table.setItem(row_index, 1, QTableWidgetItem(row["last_seen_at"]))
             self.table.setItem(row_index, 2, QTableWidgetItem(str(row["chunk_count"])))
             self.table.setItem(row_index, 3, QTableWidgetItem(row["status"]))
+        self.update_action_buttons()
+
+    def update_action_buttons(self) -> None:
+        has_investigation = self.investigation_id is not None
+        has_selection = self.selected_disappeared_id() is not None
+        self.refresh_button.setEnabled(has_investigation)
+        self.inactive_button.setEnabled(has_selection)
+        self.keep_button.setEnabled(has_selection)
+        self.update_path_button.setEnabled(has_selection)
 
     def selected_disappeared_id(self) -> int | None:
         row = self.table.currentRow()

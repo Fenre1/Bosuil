@@ -11,7 +11,12 @@ from investigation_rag.embeddings.embedding_cache import EmbeddingCache
 from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.ingest.pipeline import ScanPipeline
 from investigation_rag.rag.ollama_llm import OllamaLLM
-from investigation_rag.rag.strict_answering import StrictAnswerer
+from investigation_rag.rag.strict_answering import (
+    ANSWER_STYLE_BOTH,
+    ANSWER_STYLE_LENIENT,
+    ANSWER_STYLE_STRICT,
+    StrictAnswerer,
+)
 from investigation_rag.retrieval.hybrid_search import HybridSearcher
 from investigation_rag.retrieval.keyword_search import KeywordSearcher
 from investigation_rag.retrieval.pipeline import RetrievalPipeline
@@ -62,11 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=None)
     search.set_defaults(func=cmd_search)
 
-    ask = sub.add_parser("ask", help="Ask a strict RAG question against one investigation.")
+    ask = sub.add_parser("ask", help="Ask a RAG question against one investigation.")
     add_investigation_selector(ask)
     ask.add_argument("question")
     ask.add_argument("--top-k", type=int, default=None)
     ask.add_argument("--retrieval-profile", choices=["legacy", "standard", "deep"], default="standard")
+    ask.add_argument(
+        "--answer-style",
+        choices=[ANSWER_STYLE_STRICT, ANSWER_STYLE_LENIENT, ANSWER_STYLE_BOTH],
+        default=ANSWER_STYLE_STRICT,
+        help="How much freedom the answering model has.",
+    )
+    ask.add_argument(
+        "--evidence-ledger",
+        action="store_true",
+        help="Build an evidence ledger before generating the final answer.",
+    )
     ask.set_defaults(func=cmd_ask)
 
     return parser
@@ -124,12 +140,28 @@ def cmd_search(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int
 def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
     investigation_id = resolve_investigation_id(db, args)
     llm = OllamaLLM(
-        OllamaClient(config.ollama_base_url, timeout=config.ollama_timeout_seconds),
+        OllamaClient(
+            config.ollama_base_url,
+            timeout=config.ollama_timeout_seconds,
+            allow_remote=config.ollama_allow_remote,
+        ),
         config.ollama_llm_model,
     )
     searcher = build_rag_searcher(config, db, args.retrieval_profile, llm)
     answerer = StrictAnswerer(searcher, llm)
-    response = answerer.answer(investigation_id, args.question, top_k=args.top_k)
+    if args.evidence_ledger:
+        response = answerer.answer_with_evidence_ledger(
+            investigation_id,
+            args.question,
+            answer_style=args.answer_style,
+        )
+    else:
+        response = answerer.answer(
+            investigation_id,
+            args.question,
+            top_k=args.top_k,
+            answer_style=args.answer_style,
+        )
     print(response.answer)
     if response.citations:
         print("\nCitations:")
@@ -155,7 +187,11 @@ def build_searcher(config: AppConfig, db: SQLiteDB, mode: str) -> object:
     store = LanceDBStore(config.lancedb_dir)
     embeddings = EmbeddingCache(
         db,
-        OllamaClient(config.ollama_base_url, timeout=config.ollama_timeout_seconds),
+        OllamaClient(
+            config.ollama_base_url,
+            timeout=config.ollama_timeout_seconds,
+            allow_remote=config.ollama_allow_remote,
+        ),
         config.ollama_embed_model,
     )
     vector = VectorSearcher(db, store, embeddings, query_instruction=config.ollama_embed_query_instruction)
@@ -172,7 +208,11 @@ def build_rag_searcher(config: AppConfig, db: SQLiteDB, profile_name: str = "sta
     if config.ollama_embed_model:
         embeddings = EmbeddingCache(
             db,
-            OllamaClient(config.ollama_base_url, timeout=config.ollama_timeout_seconds),
+            OllamaClient(
+                config.ollama_base_url,
+                timeout=config.ollama_timeout_seconds,
+                allow_remote=config.ollama_allow_remote,
+            ),
             config.ollama_embed_model,
         )
         vector = VectorSearcher(db, store, embeddings, query_instruction=config.ollama_embed_query_instruction)

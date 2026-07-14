@@ -11,6 +11,8 @@ from investigation_rag.rag.prompt_builder import (
     ConversationTurn,
     build_evidence_ledger_prompt,
     build_ledger_final_answer_prompt,
+    build_lenient_ledger_final_answer_prompt,
+    build_lenient_prompt,
     build_contextual_query_prompt,
     build_strict_prompt,
     location_label,
@@ -22,6 +24,10 @@ INSUFFICIENT_EVIDENCE = "The retrieved evidence is insufficient to answer that."
 LEDGER_INSUFFICIENT_EVIDENCE = "The evidence ledger is insufficient to answer that."
 EVIDENCE_LEDGER_CHUNK_LIMIT = 50
 EVIDENCE_LEDGER_BATCH_SIZE = 5
+ANSWER_STYLE_STRICT = "strict"
+ANSWER_STYLE_LENIENT = "lenient"
+ANSWER_STYLE_BOTH = "both"
+ANSWER_STYLE_CHOICES = {ANSWER_STYLE_STRICT, ANSWER_STYLE_LENIENT, ANSWER_STYLE_BOTH}
 
 
 @dataclass
@@ -30,8 +36,17 @@ class RAGAnswer:
     citations: str
     results: list[SearchResult]
     retrieval_query: str = ""
+    answer_style: str = ANSWER_STYLE_STRICT
     evidence_ledger: list[dict[str, object]] | None = None
     process_feedback: list[str] | None = None
+
+
+@dataclass
+class EvidenceLedgerRun:
+    retrieval_query: str
+    results: list[SearchResult]
+    ledger: list[dict[str, object]]
+    process_feedback: list[str]
 
 
 class StrictAnswerer:
@@ -46,7 +61,9 @@ class StrictAnswerer:
         top_k: int | None = None,
         history: list[ConversationTurn] | None = None,
         folder_paths: list[str] | None = None,
+        answer_style: str = ANSWER_STYLE_STRICT,
     ) -> RAGAnswer:
+        normalized_style = normalize_answer_style(answer_style)
         retrieval_query = self.contextualize_question(question, history or [])
         search_limit = top_k if top_k is not None else getattr(self.searcher, "final_answer_chunks", 8)
         if folder_paths is None:
@@ -58,21 +75,53 @@ class StrictAnswerer:
                 limit=search_limit,
                 folder_paths=folder_paths,
             )
-        if not results:
+        if not results and normalized_style == ANSWER_STYLE_STRICT:
             return RAGAnswer(
                 answer=INSUFFICIENT_EVIDENCE,
                 citations="",
                 results=[],
                 retrieval_query=retrieval_query,
+                answer_style=normalized_style,
             )
-        prompt = build_strict_prompt(question, results, history=history)
-        answer = self.llm.answer(prompt).strip() or INSUFFICIENT_EVIDENCE
+        answer = self.answer_from_results(question, results, history=history, answer_style=normalized_style)
         return RAGAnswer(
             answer=answer,
             citations=format_citations(results),
             results=results,
             retrieval_query=retrieval_query,
+            answer_style=normalized_style,
         )
+
+    def answer_from_results(
+        self,
+        question: str,
+        results: list[SearchResult],
+        history: list[ConversationTurn] | None = None,
+        answer_style: str = ANSWER_STYLE_STRICT,
+    ) -> str:
+        normalized_style = normalize_answer_style(answer_style)
+        if normalized_style == ANSWER_STYLE_STRICT:
+            if not results:
+                return INSUFFICIENT_EVIDENCE
+            prompt = build_strict_prompt(question, results, history=history)
+            return self.llm.answer(prompt).strip() or INSUFFICIENT_EVIDENCE
+        if normalized_style == ANSWER_STYLE_LENIENT:
+            prompt = build_lenient_prompt(question, results, history=history)
+            return self.llm.answer(prompt).strip() or INSUFFICIENT_EVIDENCE
+
+        strict_answer = self.answer_from_results(
+            question,
+            results,
+            history=history,
+            answer_style=ANSWER_STYLE_STRICT,
+        )
+        lenient_answer = self.answer_from_results(
+            question,
+            results,
+            history=history,
+            answer_style=ANSWER_STYLE_LENIENT,
+        )
+        return format_dual_answer(strict_answer, lenient_answer)
 
     def answer_with_evidence_ledger(
         self,
@@ -81,7 +130,51 @@ class StrictAnswerer:
         history: list[ConversationTurn] | None = None,
         folder_paths: list[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        answer_style: str = ANSWER_STYLE_STRICT,
     ) -> RAGAnswer:
+        normalized_style = normalize_answer_style(answer_style)
+        ledger_run = self.build_evidence_ledger(
+            investigation_id,
+            question,
+            history=history,
+            folder_paths=folder_paths,
+            progress_callback=progress_callback,
+        )
+        if not ledger_run.results and normalized_style == ANSWER_STYLE_STRICT:
+            return RAGAnswer(
+                answer=LEDGER_INSUFFICIENT_EVIDENCE,
+                citations="",
+                results=[],
+                retrieval_query=ledger_run.retrieval_query,
+                answer_style=normalized_style,
+                evidence_ledger=[],
+                process_feedback=ledger_run.process_feedback,
+            )
+
+        self._report_progress(
+            ledger_run.process_feedback,
+            progress_callback,
+            final_answer_progress_message(normalized_style),
+        )
+        answer = self.answer_from_evidence_ledger(question, ledger_run.ledger, answer_style=normalized_style)
+        return RAGAnswer(
+            answer=answer,
+            citations=format_citations(ledger_run.results),
+            results=ledger_run.results,
+            retrieval_query=ledger_run.retrieval_query,
+            answer_style=normalized_style,
+            evidence_ledger=ledger_run.ledger,
+            process_feedback=ledger_run.process_feedback,
+        )
+
+    def build_evidence_ledger(
+        self,
+        investigation_id: int,
+        question: str,
+        history: list[ConversationTurn] | None = None,
+        folder_paths: list[str] | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> EvidenceLedgerRun:
         feedback: list[str] = []
         retrieval_query = self.contextualize_question(question, history or [])
         self._report_progress(feedback, progress_callback, "Retrieving up to 50 chunks for evidence ledger RAG.")
@@ -95,12 +188,10 @@ class StrictAnswerer:
                 folder_paths=folder_paths,
             )
         if not results:
-            return RAGAnswer(
-                answer=LEDGER_INSUFFICIENT_EVIDENCE,
-                citations="",
-                results=[],
+            return EvidenceLedgerRun(
                 retrieval_query=retrieval_query,
-                evidence_ledger=[],
+                results=[],
+                ledger=[],
                 process_feedback=feedback,
             )
 
@@ -138,20 +229,40 @@ class StrictAnswerer:
                 f"({len(ledger)} total).",
             )
 
-        self._report_progress(feedback, progress_callback, "Generating final answer from the evidence ledger only.")
-        if ledger:
-            final_prompt = build_ledger_final_answer_prompt(question, ledger)
-            answer = self.llm.answer(final_prompt).strip() or LEDGER_INSUFFICIENT_EVIDENCE
-        else:
-            answer = LEDGER_INSUFFICIENT_EVIDENCE
-        return RAGAnswer(
-            answer=answer,
-            citations=format_citations(results),
-            results=results,
+        return EvidenceLedgerRun(
             retrieval_query=retrieval_query,
-            evidence_ledger=ledger,
+            results=results,
+            ledger=ledger,
             process_feedback=feedback,
         )
+
+    def answer_from_evidence_ledger(
+        self,
+        question: str,
+        ledger: list[dict[str, object]],
+        answer_style: str = ANSWER_STYLE_STRICT,
+    ) -> str:
+        normalized_style = normalize_answer_style(answer_style)
+        if normalized_style == ANSWER_STYLE_STRICT:
+            if not ledger:
+                return LEDGER_INSUFFICIENT_EVIDENCE
+            final_prompt = build_ledger_final_answer_prompt(question, ledger)
+            return self.llm.answer(final_prompt).strip() or LEDGER_INSUFFICIENT_EVIDENCE
+        if normalized_style == ANSWER_STYLE_LENIENT:
+            final_prompt = build_lenient_ledger_final_answer_prompt(question, ledger)
+            return self.llm.answer(final_prompt).strip() or LEDGER_INSUFFICIENT_EVIDENCE
+
+        strict_answer = self.answer_from_evidence_ledger(
+            question,
+            ledger,
+            answer_style=ANSWER_STYLE_STRICT,
+        )
+        lenient_answer = self.answer_from_evidence_ledger(
+            question,
+            ledger,
+            answer_style=ANSWER_STYLE_LENIENT,
+        )
+        return format_dual_answer(strict_answer, lenient_answer)
 
     def contextualize_question(self, question: str, history: list[ConversationTurn]) -> str:
         if not history:
@@ -245,6 +356,23 @@ def is_duplicate_ledger_entry(entry: dict[str, object], ledger: list[dict[str, o
             if existing_claim == claim:
                 return True
     return False
+
+
+def normalize_answer_style(answer_style: str) -> str:
+    normalized = str(answer_style or ANSWER_STYLE_STRICT).strip().casefold()
+    if normalized not in ANSWER_STYLE_CHOICES:
+        raise ValueError(f"Unknown answer style: {answer_style}")
+    return normalized
+
+
+def format_dual_answer(strict_answer: str, lenient_answer: str) -> str:
+    return f"## Strict answer\n\n{strict_answer}\n\n## Lenient answer\n\n{lenient_answer}"
+
+
+def final_answer_progress_message(answer_style: str) -> str:
+    if answer_style == ANSWER_STYLE_BOTH:
+        return "Generating strict and lenient final answers from the evidence ledger."
+    return f"Generating final {answer_style} answer from the evidence ledger."
 
 
 def normalize_choice(value: object, allowed: set[str], fallback: str) -> str:
