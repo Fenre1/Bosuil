@@ -1,0 +1,44 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging output
+dist/
+build/
+*.egg-info/
+
+# Local configuration. Keep the committed example.
+.env
+.env.*
+!.env.example
+
+# Local application data, databases, vector indexes, and user documents.
+app-data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.parquet
+*.arrow
+*.feather
+*.faiss
+*.index
+*.lance/
+*.lancedb/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
