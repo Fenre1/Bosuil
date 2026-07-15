@@ -36,10 +36,13 @@ from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
+from investigation_rag.retrieval.hyde import HYDE_FINAL_CHUNK_LIMIT, HYDE_LEDGER_BATCH_SIZE
 from investigation_rag.retrieval.ranking import SearchResult
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
     ANSWER_STYLE_LENIENT,
+    EVIDENCE_LEDGER_BATCH_SIZE,
+    EVIDENCE_LEDGER_CHUNK_LIMIT,
     RAGAnswer,
     ANSWER_STYLE_STRICT,
     StrictAnswerer,
@@ -50,6 +53,7 @@ from investigation_rag.utils.windows_open import open_containing_folder, open_fi
 CITATION_REF_RE = re.compile(r"\[(\d+)\]")
 LEDGER_REF_RE = re.compile(r"\[E(\d+)\]", re.IGNORECASE)
 DEFAULT_ANSWER_MODEL = "qwen3.6:latest"
+LEDGER_PROFILE_NAMES = {"ledger", "hyde"}
 
 
 @dataclass
@@ -176,8 +180,16 @@ class RagAskWorker(QObject):
             searcher_profile = "standard" if self.profile_name == "ledger" else self.profile_name
             searcher = build_rag_searcher(self.config, db, searcher_profile, llm)
             answerer = StrictAnswerer(searcher, llm)
-            if self.profile_name == "ledger":
-                self.progress.emit(self.request_id, "Building evidence ledger in the background.")
+            if self.profile_name in LEDGER_PROFILE_NAMES:
+                if self.profile_name == "hyde":
+                    progress_message = "Building Hyde evidence ledger in the background."
+                    chunk_limit = HYDE_FINAL_CHUNK_LIMIT
+                    batch_size = HYDE_LEDGER_BATCH_SIZE
+                else:
+                    progress_message = "Building evidence ledger in the background."
+                    chunk_limit = EVIDENCE_LEDGER_CHUNK_LIMIT
+                    batch_size = EVIDENCE_LEDGER_BATCH_SIZE
+                self.progress.emit(self.request_id, progress_message)
                 response = answerer.answer_with_evidence_ledger(
                     self.investigation_id,
                     self.question,
@@ -187,6 +199,8 @@ class RagAskWorker(QObject):
                     progress_callback=lambda message: self.progress.emit(self.request_id, message),
                     ledger_callback=lambda ledger: self.ledger_updated.emit(self.request_id, ledger),
                     answer_style=self.answer_style,
+                    chunk_limit=chunk_limit,
+                    batch_size=batch_size,
                 )
             else:
                 self.progress.emit(self.request_id, "Retrieving evidence and generating the answer in the background.")
@@ -267,6 +281,7 @@ class RagPanel(QWidget):
         self.profile_combo.addItem("Standard retrieval", "standard")
         self.profile_combo.addItem("Deep retrieval", "deep")
         self.profile_combo.addItem("Evidence ledger RAG", "ledger")
+        self.profile_combo.addItem("Hyde", "hyde")
         self.profile_combo.addItem("Legacy retrieval", "legacy")
         self.answer_style_combo = QComboBox()
         self.answer_style_combo.setMinimumWidth(150)
@@ -455,7 +470,7 @@ class RagPanel(QWidget):
         request_id = self._ask_request_id
         self._pending_question = question
         self._pending_progress_lines = ["Answer task started in the background."]
-        self._pending_ledger = [] if profile_name == "ledger" else None
+        self._pending_ledger = [] if profile_name in LEDGER_PROFILE_NAMES else None
         self._ledger_progress_lines = self._pending_progress_lines
         self.set_busy(True)
         self.refresh_answer_view()

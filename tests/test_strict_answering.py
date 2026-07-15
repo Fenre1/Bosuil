@@ -193,6 +193,46 @@ def test_evidence_ledger_both_answers_reuse_one_ledger():
     assert "Raw chunk text" not in llm.prompts[2]
 
 
+def test_evidence_ledger_accepts_custom_chunk_limit_and_batch_size():
+    results = [
+        SearchResult(
+            chunk_id=f"c{index}",
+            investigation_id=1,
+            file_id=1,
+            path=f"C:/case/report-{index}.pdf",
+            chunk_text=f"Chunk {index} says the payment was received on 5 May.",
+            source_type="pdf",
+            chunk_index=index - 1,
+            page_number=index,
+            score=1.0,
+        )
+        for index in range(1, 10)
+    ]
+    searcher = FakeSearcher(results)
+    llm = FakeLLM(
+        [
+            '{"new_evidence": []}',
+            '{"new_evidence": []}',
+            "The evidence ledger is insufficient to answer that.",
+        ]
+    )
+    progress = []
+    answerer = StrictAnswerer(searcher, llm)
+
+    answerer.answer_with_evidence_ledger(
+        1,
+        "When was the payment received?",
+        progress_callback=progress.append,
+        chunk_limit=80,
+        batch_size=8,
+    )
+
+    assert searcher.limits == [80]
+    assert "Retrieving up to 80 chunks for evidence ledger RAG." in progress[0]
+    assert "Evidence ledger round 1 of 2: analysing chunks 1-8." in progress
+    assert "Evidence ledger round 2 of 2: analysing chunks 9-9." in progress
+
+
 class FakeSearcher:
     def __init__(self, results):
         self.results = results

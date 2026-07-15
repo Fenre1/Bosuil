@@ -46,12 +46,22 @@ DEEP_PROFILE = RetrievalProfile(
     context_expansion_enabled=True,
 )
 
+HYDE_PROFILE = RetrievalProfile(
+    name="hyde",
+    keyword_candidates=0,
+    vector_candidates=80,
+    fusion_candidates=80,
+    rerank_candidates=80,
+    final_answer_chunks=80,
+)
+
 PROFILES = {
     profile.name: profile
     for profile in (
         LEGACY_PROFILE,
         STANDARD_PROFILE,
         DEEP_PROFILE,
+        HYDE_PROFILE,
     )
 }
 
@@ -78,6 +88,8 @@ def profile_from_config(config: object, name: str | None) -> RetrievalProfile:
             query_expansion_enabled=True,
             context_expansion_enabled=True,
         )
+    if key == "hyde":
+        return HYDE_PROFILE
     if key == "standard":
         return RetrievalProfile(
             name="standard",

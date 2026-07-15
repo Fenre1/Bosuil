@@ -14,7 +14,7 @@ python -m pip install --upgrade pip
 pip install -e ".[dev]"
 ```
 
-Install and start Ollama separately, then pull the local models you want to use. The app does not hard-code model names.
+Install and start Ollama separately, then pull the local models you want to use. Most modes use the configured or selected local models; Hyde retrieval prefers `Gemma4:e4b` for fake-document generation when that model is installed, then falls back to the selected answer model.
 
 Create a `.env` file from `.env.example`:
 
@@ -67,6 +67,7 @@ investigation-rag scan-investigation --name "Case A"
 investigation-rag search-investigation --name "Case A" --mode keyword "invoice"
 investigation-rag search-investigation --name "Case A" --mode semantic "payments after May"
 investigation-rag ask --name "Case A" "What evidence mentions payments after May?"
+investigation-rag ask --name "Case A" --retrieval-profile hyde "What evidence mentions payments after May?"
 ```
 
 If Ollama or LanceDB is unavailable, keyword search and non-embedding scan functions still work. Embedding and RAG operations report a clear local configuration/runtime error.

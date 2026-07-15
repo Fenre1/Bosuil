@@ -27,9 +27,25 @@ class VectorSearcher:
         folder_paths: list[str] | None = None,
         source_types: list[str] | None = None,
     ) -> list[SearchResult]:
+        return self.search_embedding_text(
+            investigation_id,
+            format_embedding_query(query, self.query_instruction),
+            limit=limit,
+            folder_paths=folder_paths,
+            source_types=source_types,
+        )
+
+    def search_embedding_text(
+        self,
+        investigation_id: int,
+        embedding_text: str,
+        limit: int = 20,
+        folder_paths: list[str] | None = None,
+        source_types: list[str] | None = None,
+    ) -> list[SearchResult]:
         if folder_paths == [] or source_types == []:
             return []
-        query_vector = self.embeddings.embed_texts([format_embedding_query(query, self.query_instruction)])[0]
+        query_vector = self.embeddings.embed_texts([embedding_text.strip()])[0]
         vector_rows = self.store.search(
             query_vector,
             investigation_id=investigation_id,

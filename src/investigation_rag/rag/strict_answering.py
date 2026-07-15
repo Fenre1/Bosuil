@@ -166,6 +166,8 @@ class StrictAnswerer:
         progress_callback: Callable[[str], None] | None = None,
         ledger_callback: Callable[[list[dict[str, object]]], None] | None = None,
         answer_style: str = ANSWER_STYLE_STRICT,
+        chunk_limit: int = EVIDENCE_LEDGER_CHUNK_LIMIT,
+        batch_size: int = EVIDENCE_LEDGER_BATCH_SIZE,
     ) -> RAGAnswer:
         normalized_style = normalize_answer_style(answer_style)
         started = perf_counter()
@@ -177,9 +179,12 @@ class StrictAnswerer:
             source_types=source_types,
             progress_callback=progress_callback,
             ledger_callback=ledger_callback,
+            chunk_limit=chunk_limit,
+            batch_size=batch_size,
         )
         feedback = [
             format_timing_step(TimingStep("Evidence ledger creation", perf_counter() - started)),
+            *ledger_run.process_feedback,
         ]
         if progress_callback is not None:
             progress_callback(feedback[-1])
@@ -226,27 +231,38 @@ class StrictAnswerer:
         source_types: list[str] | None = None,
         progress_callback: Callable[[str], None] | None = None,
         ledger_callback: Callable[[list[dict[str, object]]], None] | None = None,
+        chunk_limit: int = EVIDENCE_LEDGER_CHUNK_LIMIT,
+        batch_size: int = EVIDENCE_LEDGER_BATCH_SIZE,
     ) -> EvidenceLedgerRun:
         progress_feedback: list[str] = []
         retrieval_query = self.contextualize_question(question, history or [], prompt_callback=progress_callback)
-        self._report_progress(progress_feedback, progress_callback, "Retrieving up to 50 chunks for evidence ledger RAG.")
+        chunk_limit = max(1, int(chunk_limit))
+        batch_size = max(1, int(batch_size))
+        self._report_progress(
+            progress_feedback,
+            progress_callback,
+            f"Retrieving up to {chunk_limit} chunks for evidence ledger RAG.",
+        )
         if folder_paths is None and source_types is None:
-            results = self.searcher.search(investigation_id, retrieval_query, limit=EVIDENCE_LEDGER_CHUNK_LIMIT)
+            results = self.searcher.search(investigation_id, retrieval_query, limit=chunk_limit)
         elif source_types is None:
             results = self.searcher.search(
                 investigation_id,
                 retrieval_query,
-                limit=EVIDENCE_LEDGER_CHUNK_LIMIT,
+                limit=chunk_limit,
                 folder_paths=folder_paths,
             )
         else:
             results = self.searcher.search(
                 investigation_id,
                 retrieval_query,
-                limit=EVIDENCE_LEDGER_CHUNK_LIMIT,
+                limit=chunk_limit,
                 folder_paths=folder_paths,
                 source_types=source_types,
             )
+        search_feedback = self.structured_search_feedback()
+        for item in search_feedback:
+            self._report_progress(progress_feedback, progress_callback, item)
         if not results:
             if ledger_callback is not None:
                 ledger_callback([])
@@ -254,20 +270,20 @@ class StrictAnswerer:
                 retrieval_query=retrieval_query,
                 results=[],
                 ledger=[],
-                process_feedback=[],
+                process_feedback=search_feedback,
             )
 
         ledger: list[dict[str, object]] = []
         batches = [
-            results[index : index + EVIDENCE_LEDGER_BATCH_SIZE]
-            for index in range(0, len(results), EVIDENCE_LEDGER_BATCH_SIZE)
+            results[index : index + batch_size]
+            for index in range(0, len(results), batch_size)
         ]
         for batch_index, batch in enumerate(batches, start=1):
             self._report_progress(
                 progress_feedback,
                 progress_callback,
                 f"Evidence ledger round {batch_index} of {len(batches)}: analysing chunks "
-                f"{((batch_index - 1) * EVIDENCE_LEDGER_BATCH_SIZE) + 1}-{((batch_index - 1) * EVIDENCE_LEDGER_BATCH_SIZE) + len(batch)}.",
+                f"{((batch_index - 1) * batch_size) + 1}-{((batch_index - 1) * batch_size) + len(batch)}.",
             )
             prompt = build_evidence_ledger_prompt(
                 question,
@@ -307,7 +323,7 @@ class StrictAnswerer:
             retrieval_query=retrieval_query,
             results=results,
             ledger=ledger,
-            process_feedback=[],
+            process_feedback=search_feedback,
         )
 
     def answer_from_evidence_ledger(
@@ -390,6 +406,16 @@ class StrictAnswerer:
             feedback.extend(format_timing_steps(steps))
             return feedback
         feedback.append(format_timing_step(TimingStep("Retrieval", fallback_seconds)))
+        return feedback
+
+    def structured_search_feedback(self) -> list[str]:
+        feedback: list[str] = []
+        messages = getattr(self.searcher, "last_process_feedback", None)
+        if isinstance(messages, list):
+            feedback.extend(str(message) for message in messages if message)
+        steps = getattr(self.searcher, "last_timing_steps", None)
+        if isinstance(steps, list) and steps:
+            feedback.extend(format_timing_steps(steps))
         return feedback
 
     @staticmethod

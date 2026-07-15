@@ -18,6 +18,12 @@ from investigation_rag.rag.strict_answering import (
     StrictAnswerer,
 )
 from investigation_rag.retrieval.hybrid_search import HybridSearcher
+from investigation_rag.retrieval.hyde import (
+    HYDE_FINAL_CHUNK_LIMIT,
+    HYDE_LEDGER_BATCH_SIZE,
+    HydeSearcher,
+    choose_hyde_model,
+)
 from investigation_rag.retrieval.keyword_search import KeywordSearcher
 from investigation_rag.retrieval.pipeline import RetrievalPipeline
 from investigation_rag.retrieval.profiles import profile_from_config
@@ -78,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_investigation_selector(ask)
     ask.add_argument("question")
     ask.add_argument("--top-k", type=int, default=None)
-    ask.add_argument("--retrieval-profile", choices=["legacy", "standard", "deep"], default="standard")
+    ask.add_argument("--retrieval-profile", choices=["legacy", "standard", "deep", "hyde"], default="standard")
     ask.add_argument(
         "--type",
         dest="source_types",
@@ -164,7 +170,17 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
     )
     searcher = build_rag_searcher(config, db, args.retrieval_profile, llm)
     answerer = StrictAnswerer(searcher, llm)
-    if args.evidence_ledger:
+    if args.retrieval_profile == "hyde":
+        response = answerer.answer_with_evidence_ledger(
+            investigation_id,
+            args.question,
+            source_types=args.source_types,
+            answer_style=args.answer_style,
+            progress_callback=lambda message: print(message, file=sys.stderr),
+            chunk_limit=HYDE_FINAL_CHUNK_LIMIT,
+            batch_size=HYDE_LEDGER_BATCH_SIZE,
+        )
+    elif args.evidence_ledger:
         response = answerer.answer_with_evidence_ledger(
             investigation_id,
             args.question,
@@ -224,7 +240,7 @@ def build_searcher(config: AppConfig, db: SQLiteDB, mode: str) -> object:
 
 def build_rag_searcher(config: AppConfig, db: SQLiteDB, profile_name: str = "standard", llm: OllamaLLM | None = None) -> object:
     keyword = KeywordSearcher(db)
-    profile = profile_from_config(config, profile_name)
+    normalized_profile = (profile_name or "standard").strip().lower()
     store = LanceDBStore(config.lancedb_dir)
     vector = None
     if config.ollama_embed_model:
@@ -238,6 +254,15 @@ def build_rag_searcher(config: AppConfig, db: SQLiteDB, profile_name: str = "sta
             config.ollama_embed_model,
         )
         vector = VectorSearcher(db, store, embeddings, query_instruction=config.ollama_embed_query_instruction)
+    if normalized_profile == "hyde":
+        if vector is None:
+            raise ValueError("Hyde retrieval requires OLLAMA_EMBED_MODEL to be configured.")
+        if llm is None:
+            raise ValueError("Hyde retrieval requires an Ollama answering model.")
+        hyde_model = choose_hyde_model(llm.client, llm.model)
+        hyde_llm = llm if hyde_model == llm.model else OllamaLLM(llm.client, hyde_model)
+        return HydeSearcher(vector, hyde_llm)
+    profile = profile_from_config(config, normalized_profile)
     query_expander = QueryExpander(llm) if profile.query_expansion_enabled and llm is not None else None
     return RetrievalPipeline(
         keyword=keyword,

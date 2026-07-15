@@ -33,6 +33,20 @@ def test_vector_search_embeds_instructed_query():
     assert embeddings.texts == ["Instruct: Given a user question, retrieve relevant passages.\nQuery: payment date"]
 
 
+def test_vector_search_can_embed_raw_document_text():
+    embeddings = FakeEmbeddings()
+    searcher = VectorSearcher(
+        FakeDB(),
+        FakeStore(),
+        embeddings,
+        query_instruction="Given a user question, retrieve relevant passages.",
+    )
+
+    searcher.search_embedding_text(1, "A synthetic paragraph about an invoice date.")
+
+    assert embeddings.texts == ["A synthetic paragraph about an invoice date."]
+
+
 class FakeEmbeddings:
     model = "test-model"
 
