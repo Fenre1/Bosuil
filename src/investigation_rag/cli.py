@@ -65,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--mode", choices=["keyword", "semantic", "hybrid"], default="keyword")
     search.add_argument("--limit", type=int, default=None)
+    search.add_argument(
+        "--type",
+        dest="source_types",
+        action="append",
+        choices=["txt", "docx", "pdf", "msg"],
+        help="Limit search to a file type. May be repeated.",
+    )
     search.set_defaults(func=cmd_search)
 
     ask = sub.add_parser("ask", help="Ask a RAG question against one investigation.")
@@ -72,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("question")
     ask.add_argument("--top-k", type=int, default=None)
     ask.add_argument("--retrieval-profile", choices=["legacy", "standard", "deep"], default="standard")
+    ask.add_argument(
+        "--type",
+        dest="source_types",
+        action="append",
+        choices=["txt", "docx", "pdf", "msg"],
+        help="Limit retrieval to a file type. May be repeated.",
+    )
     ask.add_argument(
         "--answer-style",
         choices=[ANSWER_STYLE_STRICT, ANSWER_STYLE_LENIENT, ANSWER_STYLE_BOTH],
@@ -126,7 +140,7 @@ def cmd_search(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int
     investigation_id = resolve_investigation_id(db, args)
     searcher = build_searcher(config, db, args.mode)
     limit = args.limit if args.limit is not None else (None if args.mode == "keyword" else 10)
-    results = searcher.search(investigation_id, args.query, limit=limit)
+    results = searcher.search(investigation_id, args.query, limit=limit, source_types=args.source_types)
     if not results:
         print("No results.")
         return 0
@@ -144,6 +158,7 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
             config.ollama_base_url,
             timeout=config.ollama_timeout_seconds,
             allow_remote=config.ollama_allow_remote,
+            num_ctx=config.ollama_num_ctx,
         ),
         config.ollama_llm_model,
     )
@@ -153,19 +168,26 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
         response = answerer.answer_with_evidence_ledger(
             investigation_id,
             args.question,
+            source_types=args.source_types,
             answer_style=args.answer_style,
+            progress_callback=lambda message: print(message, file=sys.stderr),
         )
     else:
         response = answerer.answer(
             investigation_id,
             args.question,
             top_k=args.top_k,
+            source_types=args.source_types,
             answer_style=args.answer_style,
         )
     print(response.answer)
     if response.citations:
         print("\nCitations:")
         print(response.citations)
+    if response.process_feedback:
+        print("\nProcess:")
+        for item in response.process_feedback:
+            print(f"- {item}")
     return 0
 
 

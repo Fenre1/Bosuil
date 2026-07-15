@@ -16,11 +16,18 @@ class KeywordSearcher:
         query: str,
         limit: int | None = 20,
         folder_paths: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[SearchResult]:
         fts_query = to_fts_query(query)
         if not fts_query:
             return []
-        rows = self.db.keyword_search(investigation_id, fts_query, limit, folder_paths=folder_paths)
+        rows = self.db.keyword_search(
+            investigation_id,
+            fts_query,
+            limit,
+            folder_paths=folder_paths,
+            source_types=source_types,
+        )
         results: list[SearchResult] = []
         for row in rows:
             try:

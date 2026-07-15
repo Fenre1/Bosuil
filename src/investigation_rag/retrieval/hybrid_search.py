@@ -17,9 +17,22 @@ class HybridSearcher:
         query: str,
         limit: int = 20,
         folder_paths: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[SearchResult]:
-        keyword_results = self.keyword.search(investigation_id, query, limit=limit, folder_paths=folder_paths)
+        keyword_results = self.keyword.search(
+            investigation_id,
+            query,
+            limit=limit,
+            folder_paths=folder_paths,
+            source_types=source_types,
+        )
         vector_results: list[SearchResult] = []
         if self.vector is not None:
-            vector_results = self.vector.search(investigation_id, query, limit=limit, folder_paths=folder_paths)
+            vector_results = self.vector.search(
+                investigation_id,
+                query,
+                limit=limit,
+                folder_paths=folder_paths,
+                source_types=source_types,
+            )
         return reciprocal_rank_fusion(keyword_results, vector_results, limit=limit)

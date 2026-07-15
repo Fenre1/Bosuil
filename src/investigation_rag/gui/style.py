@@ -38,6 +38,12 @@ QLabel#AppTitle {
     font-weight: 700;
 }
 
+QLabel#HeaderInvestigationName {
+    color: #5b6472;
+    font-size: 10pt;
+    font-weight: 600;
+}
+
 QLabel#FieldLabel,
 QLabel#StatusLabel {
     color: #5b6472;

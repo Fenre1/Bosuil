@@ -90,3 +90,99 @@ def test_ollama_requests_ignore_environment_proxies(monkeypatch):
     assert models == []
     assert FakeSession.latest is not None
     assert FakeSession.latest.calls == [("GET", "http://127.0.0.1:11434/api/tags", 120, {}, False)]
+
+
+def test_generate_passes_num_ctx_when_configured(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"response": "answer"}
+
+    class FakeSession:
+        latest = None
+
+        def __init__(self):
+            self.trust_env = True
+            self.calls = []
+            FakeSession.latest = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, method, url, timeout, **kwargs):
+            self.calls.append((method, url, timeout, kwargs, self.trust_env))
+            return FakeResponse()
+
+    class FakeRequests:
+        Session = FakeSession
+
+    monkeypatch.setitem(sys.modules, "requests", FakeRequests)
+
+    answer = OllamaClient("http://127.0.0.1:11434", num_ctx=32768).generate("qwen", "Question?")
+
+    assert answer == "answer"
+    assert FakeSession.latest is not None
+    assert FakeSession.latest.calls == [
+        (
+            "POST",
+            "http://127.0.0.1:11434/api/generate",
+            120,
+            {
+                "json": {
+                    "model": "qwen",
+                    "prompt": "Question?",
+                    "stream": False,
+                    "options": {"num_ctx": 32768},
+                }
+            },
+            False,
+        )
+    ]
+
+
+def test_generate_omits_num_ctx_when_unset(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"response": "answer"}
+
+    class FakeSession:
+        latest = None
+
+        def __init__(self):
+            self.trust_env = True
+            self.calls = []
+            FakeSession.latest = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def request(self, method, url, timeout, **kwargs):
+            self.calls.append((method, url, timeout, kwargs, self.trust_env))
+            return FakeResponse()
+
+    class FakeRequests:
+        Session = FakeSession
+
+    monkeypatch.setitem(sys.modules, "requests", FakeRequests)
+
+    OllamaClient("http://127.0.0.1:11434").generate("qwen", "Question?")
+
+    assert FakeSession.latest is not None
+    assert FakeSession.latest.calls[0][3] == {
+        "json": {
+            "model": "qwen",
+            "prompt": "Question?",
+            "stream": False,
+        }
+    }

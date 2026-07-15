@@ -29,6 +29,7 @@ INVESTIGATION_RAG_DATA_DIR=C:\InvestigationRAGData
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0
 OLLAMA_TIMEOUT_SECONDS=120
+OLLAMA_NUM_CTX=32768
 OLLAMA_LLM_MODEL=<your-local-chat-model>
 OLLAMA_EMBED_MODEL=<your-local-embedding-model>
 OLLAMA_EMBED_QUERY_INSTRUCTION=Given a user question, retrieve relevant passages from a local document collection that answer the question.
@@ -39,6 +40,8 @@ By default data is stored under `%LOCALAPPDATA%\InvestigationRAG`. Real environm
 The app rejects non-loopback Ollama URLs by default and the Ollama client ignores proxy environment variables. Keep `INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0` for sensitive data. Only set it to `1` for a trusted non-sensitive setup where the Ollama server is intentionally hosted away from the same machine.
 
 For slower local models or long evidence-ledger RAG runs, raise `OLLAMA_TIMEOUT_SECONDS` in `.env`; for example, `600` waits up to ten minutes for each local Ollama request.
+
+Set `OLLAMA_NUM_CTX` to pass Ollama's `options.num_ctx` for answering-model requests. Use `32768` for a 32k context window, or set it to `0`/leave it unset to use the Ollama/model default.
 
 ## Run the Desktop App
 

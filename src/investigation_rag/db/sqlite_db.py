@@ -530,14 +530,25 @@ class SQLiteDB:
         self,
         chunk_ids: list[str],
         folder_paths: list[str] | None,
+        source_types: list[str] | None = None,
         active_only: bool = True,
     ) -> list[sqlite3.Row]:
-        if folder_paths is None:
+        if folder_paths is None and source_types is None:
             return self.get_chunks_by_ids(chunk_ids, active_only=active_only)
-        if not chunk_ids or not folder_paths:
+        if not chunk_ids or folder_paths == [] or source_types == []:
             return []
         placeholders = ",".join("?" for _ in chunk_ids)
-        folder_sql, folder_params = self._folder_scope_sql(folder_paths, alias="f")
+        filter_sql = []
+        filter_params: list[str] = []
+        if folder_paths is not None:
+            folder_sql, folder_params = self._folder_scope_sql(folder_paths, alias="f")
+            filter_sql.append(f"({folder_sql})")
+            filter_params.extend(folder_params)
+        if source_types is not None:
+            source_type_sql, source_type_params = self._source_type_scope_sql(source_types, alias="c")
+            filter_sql.append(f"({source_type_sql})")
+            filter_params.extend(source_type_params)
+        filters = f"AND {' AND '.join(filter_sql)}" if filter_sql else ""
         active_sql = "AND c.is_active = 1" if active_only else ""
         with self.connection() as conn:
             rows = conn.execute(
@@ -547,9 +558,9 @@ class SQLiteDB:
                 JOIN files f ON f.id = c.file_id
                 WHERE c.id IN ({placeholders})
                   {active_sql}
-                  AND ({folder_sql})
+                  {filters}
                 """,
-                [*chunk_ids, *folder_params],
+                [*chunk_ids, *filter_params],
             ).fetchall()
         by_id = {row["id"]: row for row in rows}
         return [by_id[cid] for cid in chunk_ids if cid in by_id]
@@ -560,20 +571,29 @@ class SQLiteDB:
         chunk_index: int,
         before: int = 1,
         after: int = 1,
+        source_types: list[str] | None = None,
     ) -> list[sqlite3.Row]:
+        if source_types == []:
+            return []
         start = max(0, chunk_index - max(0, before))
         end = chunk_index + max(0, after)
+        source_type_sql = ""
+        source_type_params: list[str] = []
+        if source_types is not None:
+            scoped_sql, source_type_params = self._source_type_scope_sql(source_types)
+            source_type_sql = f"AND ({scoped_sql})"
         with self.connection() as conn:
             return conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM chunks
                 WHERE file_id = ?
                   AND is_active = 1
                   AND chunk_index BETWEEN ? AND ?
+                  {source_type_sql}
                 ORDER BY chunk_index
                 """,
-                (file_id, start, end),
+                [file_id, start, end, *source_type_params],
             ).fetchall()
 
     def get_extraction_cache(self, content_hash: str, extractor_version: str, source_type: str) -> dict[str, Any] | None:
@@ -630,18 +650,24 @@ class SQLiteDB:
         query: str,
         limit: int | None,
         folder_paths: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[sqlite3.Row]:
-        if folder_paths == []:
+        if folder_paths == [] or source_types == []:
             return []
         folder_sql = ""
         folder_params: list[str] = []
         if folder_paths is not None:
             scoped_sql, folder_params = self._folder_scope_sql(folder_paths, alias="f")
             folder_sql = f"AND ({scoped_sql})"
+        source_type_sql = ""
+        source_type_params: list[str] = []
+        if source_types is not None:
+            scoped_sql, source_type_params = self._source_type_scope_sql(source_types, alias="c")
+            source_type_sql = f"AND ({scoped_sql})"
         limit_sql = "LIMIT ?" if limit is not None else ""
         with self.connection() as conn:
             try:
-                params: list[object] = [query, investigation_id, *folder_params]
+                params: list[object] = [query, investigation_id, *folder_params, *source_type_params]
                 if limit is not None:
                     params.append(limit)
                 return conn.execute(
@@ -654,6 +680,7 @@ class SQLiteDB:
                       AND c.investigation_id = ?
                       AND c.is_active = 1
                       {folder_sql}
+                      {source_type_sql}
                     ORDER BY rank
                     {limit_sql}
                     """,
@@ -661,7 +688,7 @@ class SQLiteDB:
                 ).fetchall()
             except sqlite3.OperationalError:
                 like = f"%{query}%"
-                params = [investigation_id, like, *folder_params]
+                params = [investigation_id, like, *folder_params, *source_type_params]
                 if limit is not None:
                     params.append(limit)
                 return conn.execute(
@@ -671,6 +698,7 @@ class SQLiteDB:
                     JOIN files f ON f.id = c.file_id
                     WHERE c.investigation_id = ? AND c.is_active = 1 AND c.chunk_text LIKE ?
                       {folder_sql}
+                      {source_type_sql}
                     ORDER BY c.updated_at DESC
                     {limit_sql}
                     """,
@@ -704,6 +732,20 @@ class SQLiteDB:
             )
             params.extend([normalized, f"{normalized}\\%", f"{normalized}/%"])
         return " OR ".join(clauses), params
+
+    @staticmethod
+    def _source_type_scope_sql(source_types: list[str], alias: str = "chunks") -> tuple[str, list[str]]:
+        normalized = sorted(
+            {
+                str(source_type).strip().lower().lstrip(".")
+                for source_type in source_types
+                if str(source_type).strip()
+            }
+        )
+        if not normalized:
+            return "0", []
+        placeholders = ",".join("?" for _ in normalized)
+        return f"{alias}.source_type IN ({placeholders})", normalized
 
     def active_files_for_investigation(self, investigation_id: int) -> list[sqlite3.Row]:
         with self.connection() as conn:

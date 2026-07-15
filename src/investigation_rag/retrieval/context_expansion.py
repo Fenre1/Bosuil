@@ -7,10 +7,17 @@ from investigation_rag.retrieval.ranking import SearchResult, row_to_result
 
 
 class NeighborContextExpander:
-    def __init__(self, db: SQLiteDB, before: int = 1, after: int = 1):
+    def __init__(
+        self,
+        db: SQLiteDB,
+        before: int = 1,
+        after: int = 1,
+        source_types: list[str] | None = None,
+    ):
         self.db = db
         self.before = before
         self.after = after
+        self.source_types = source_types
 
     def expand(self, selected: list[SearchResult], budget: int) -> list[SearchResult]:
         packed: list[SearchResult] = []
@@ -29,6 +36,7 @@ class NeighborContextExpander:
                 result.chunk_index,
                 before=self.before,
                 after=self.after,
+                source_types=self.source_types,
             )
             if not neighbors:
                 neighbors = []

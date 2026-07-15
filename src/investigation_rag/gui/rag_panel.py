@@ -10,7 +10,6 @@ from PyQt5.QtGui import QTextDocument
 from PyQt5.QtPrintSupport import QPrinter
 from PyQt5.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -19,6 +18,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QComboBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -32,6 +32,7 @@ from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.embeddings.ollama_client import OllamaClient
+from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
@@ -39,6 +40,7 @@ from investigation_rag.retrieval.ranking import SearchResult
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
     ANSWER_STYLE_LENIENT,
+    RAGAnswer,
     ANSWER_STYLE_STRICT,
     StrictAnswerer,
 )
@@ -46,6 +48,7 @@ from investigation_rag.utils.windows_open import open_containing_folder, open_fi
 
 
 CITATION_REF_RE = re.compile(r"\[(\d+)\]")
+LEDGER_REF_RE = re.compile(r"\[E(\d+)\]", re.IGNORECASE)
 DEFAULT_ANSWER_MODEL = "qwen3.6:latest"
 
 
@@ -119,21 +122,128 @@ class OllamaModelsWorker(QObject):
         self.finished.emit(answer_models, status)
 
 
+@dataclass(frozen=True)
+class RagAskResult:
+    request_id: int
+    investigation_id: int
+    question: str
+    response: RAGAnswer | None = None
+    error: str = ""
+
+
+class RagAskWorker(QObject):
+    progress = pyqtSignal(int, str)
+    ledger_updated = pyqtSignal(int, object)
+    finished = pyqtSignal(object)
+
+    def __init__(
+        self,
+        config: AppConfig,
+        request_id: int,
+        investigation_id: int,
+        question: str,
+        history: list[ConversationTurn],
+        profile_name: str,
+        answer_style: str,
+        answer_model: str,
+        folder_paths: list[str] | None,
+        source_types: list[str] | None,
+    ):
+        super().__init__()
+        self.config = config
+        self.request_id = request_id
+        self.investigation_id = investigation_id
+        self.question = question
+        self.history = history
+        self.profile_name = profile_name
+        self.answer_style = answer_style
+        self.answer_model = answer_model
+        self.folder_paths = folder_paths
+        self.source_types = source_types
+
+    def run(self) -> None:
+        try:
+            db = SQLiteDB(self.config.sqlite_path)
+            llm = OllamaLLM(
+                OllamaClient(
+                    self.config.ollama_base_url,
+                    timeout=self.config.ollama_timeout_seconds,
+                    allow_remote=self.config.ollama_allow_remote,
+                    num_ctx=self.config.ollama_num_ctx,
+                ),
+                self.answer_model,
+            )
+            searcher_profile = "standard" if self.profile_name == "ledger" else self.profile_name
+            searcher = build_rag_searcher(self.config, db, searcher_profile, llm)
+            answerer = StrictAnswerer(searcher, llm)
+            if self.profile_name == "ledger":
+                self.progress.emit(self.request_id, "Building evidence ledger in the background.")
+                response = answerer.answer_with_evidence_ledger(
+                    self.investigation_id,
+                    self.question,
+                    history=self.history,
+                    folder_paths=self.folder_paths,
+                    source_types=self.source_types,
+                    progress_callback=lambda message: self.progress.emit(self.request_id, message),
+                    ledger_callback=lambda ledger: self.ledger_updated.emit(self.request_id, ledger),
+                    answer_style=self.answer_style,
+                )
+            else:
+                self.progress.emit(self.request_id, "Retrieving evidence and generating the answer in the background.")
+                response = answerer.answer(
+                    self.investigation_id,
+                    self.question,
+                    history=self.history,
+                    folder_paths=self.folder_paths,
+                    source_types=self.source_types,
+                    answer_style=self.answer_style,
+                )
+            result = RagAskResult(
+                request_id=self.request_id,
+                investigation_id=self.investigation_id,
+                question=self.question,
+                response=response,
+            )
+        except Exception as exc:
+            result = RagAskResult(
+                request_id=self.request_id,
+                investigation_id=self.investigation_id,
+                question=self.question,
+                error=str(exc),
+            )
+        self.finished.emit(result)
+
+
 class RagPanel(QWidget):
-    def __init__(self, config: AppConfig, db: SQLiteDB, store: LanceDBStore, folder_scope: FolderScope | None = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        db: SQLiteDB,
+        store: LanceDBStore,
+        folder_scope: FolderScope | None = None,
+        file_type_scope: FileTypeScope | None = None,
+    ):
         super().__init__()
         self.config = config
         self.db = db
         self.store = store
         self.folder_scope = folder_scope
+        self.file_type_scope = file_type_scope
         self.investigation_id: int | None = None
         self.results: list[SearchResult] = []
         self.turns: list[ChatExchange] = []
         self.active_turn_index: int | None = None
         self._ledger_progress_lines: list[str] = []
+        self._pending_question = ""
+        self._pending_progress_lines: list[str] = []
+        self._pending_ledger: list[dict[str, object]] | None = None
+        self._ask_request_id = 0
+        self._updating_ledger_table = False
         self._is_busy = False
         self.model_thread: QThread | None = None
         self.model_worker: OllamaModelsWorker | None = None
+        self.ask_thread: QThread | None = None
+        self.ask_worker: RagAskWorker | None = None
 
         self.question_edit = SubmitTextEdit()
         self.question_edit.setObjectName("Composer")
@@ -146,12 +256,12 @@ class RagPanel(QWidget):
         self.ask_button.setMinimumWidth(96)
         self.ask_button.setMinimumHeight(38)
         self.ask_button.clicked.connect(self.ask)
-        new_button = QPushButton("New conversation")
-        new_button.setObjectName("GhostButton")
-        new_button.clicked.connect(self.new_conversation)
-        save_button = QPushButton("Save to PDF")
-        save_button.setObjectName("GhostButton")
-        save_button.clicked.connect(self.save_conversation_pdf)
+        self.new_button = QPushButton("New conversation")
+        self.new_button.setObjectName("GhostButton")
+        self.new_button.clicked.connect(self.new_conversation)
+        self.save_button = QPushButton("Save to PDF")
+        self.save_button.setObjectName("GhostButton")
+        self.save_button.clicked.connect(self.save_conversation_pdf)
         self.profile_combo = QComboBox()
         self.profile_combo.setMinimumWidth(190)
         self.profile_combo.addItem("Standard retrieval", "standard")
@@ -188,6 +298,24 @@ class RagPanel(QWidget):
         self.answer_view.setOpenLinks(False)
         self.answer_view.anchorClicked.connect(self.handle_answer_link)
 
+        self.process_view = QTextEdit()
+        self.process_view.setReadOnly(True)
+        self.process_view.setPlaceholderText("Process details will appear here")
+
+        self.ledger_table = QTableWidget(0, 4)
+        self.ledger_table.setHorizontalHeaderLabels(["ID", "Claim", "Source", "Relevance"])
+        self.ledger_table.setAlternatingRowColors(True)
+        self.ledger_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.ledger_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ledger_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ledger_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.ledger_table.itemSelectionChanged.connect(self.select_selected_ledger_source)
+
+        self.detail_tabs = QTabWidget()
+        self.detail_tabs.setMinimumWidth(320)
+        self.detail_tabs.addTab(self.process_view, "Process")
+        self.detail_tabs.addTab(self.ledger_table, "Evidence ledger")
+
         self.citation_table = QTableWidget(0, 4)
         self.citation_table.setHorizontalHeaderLabels(["#", "Source", "Location", "Path"])
         self.citation_table.setAlternatingRowColors(True)
@@ -220,15 +348,21 @@ class RagPanel(QWidget):
         citation_layout.addWidget(citation_splitter, 1)
 
         result_splitter = QSplitter(Qt.Vertical)
-        result_splitter.addWidget(self.answer_view)
+        answer_detail_splitter = QSplitter(Qt.Horizontal)
+        answer_detail_splitter.addWidget(self.answer_view)
+        answer_detail_splitter.addWidget(self.detail_tabs)
+        answer_detail_splitter.setStretchFactor(0, 3)
+        answer_detail_splitter.setStretchFactor(1, 1)
+
+        result_splitter.addWidget(answer_detail_splitter)
         result_splitter.addWidget(citation_container)
         result_splitter.setStretchFactor(0, 3)
         result_splitter.setStretchFactor(1, 2)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
-        controls.addWidget(new_button)
-        controls.addWidget(save_button)
+        controls.addWidget(self.new_button)
+        controls.addWidget(self.save_button)
         controls.addStretch(1)
         controls.addWidget(self.profile_combo)
         controls.addWidget(self.answer_style_combo)
@@ -256,13 +390,26 @@ class RagPanel(QWidget):
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         self.investigation_id = investigation_id
+        if self._is_busy:
+            self._ask_request_id += 1
+            self.clear_conversation()
+            return
         self.new_conversation()
 
     def new_conversation(self) -> None:
+        if self._is_busy:
+            return
+        self.clear_conversation()
+
+    def clear_conversation(self) -> None:
         self.turns = []
         self.results = []
         self.active_turn_index = None
+        self._pending_question = ""
+        self._pending_progress_lines = []
+        self._pending_ledger = None
         self.answer_view.clear()
+        self.update_detail_panel()
         self.citation_table.setRowCount(0)
         self.chunk_preview.clear()
         self.question_edit.clear()
@@ -273,6 +420,8 @@ class RagPanel(QWidget):
         can_configure = not self._is_busy
         can_ask = can_configure and self.investigation_id is not None
         self.question_edit.setEnabled(can_ask)
+        self.new_button.setEnabled(can_configure)
+        self.save_button.setEnabled(can_configure and bool(self.turns))
         self.profile_combo.setEnabled(can_configure)
         self.answer_style_combo.setEnabled(can_configure)
         self.answer_model_combo.setEnabled(can_configure)
@@ -290,55 +439,105 @@ class RagPanel(QWidget):
         self.folder_button.setEnabled(has_selection)
 
     def ask(self) -> None:
-        if self.investigation_id is None:
+        if self.investigation_id is None or self.ask_thread is not None:
             return
         question = self.question_edit.toPlainText().strip()
         if not question:
             self.question_edit.setFocus()
             return
         history = [ConversationTurn(turn.question, turn.answer) for turn in self.turns]
+        profile_name = str(self.profile_combo.currentData())
+        answer_style = self.selected_answer_style()
+        answer_model = self.selected_answer_model()
+        folder_paths = self.folder_scope.folder_paths() if self.folder_scope is not None else None
+        source_types = self.file_type_scope.source_types() if self.file_type_scope is not None else None
+        self._ask_request_id += 1
+        request_id = self._ask_request_id
+        self._pending_question = question
+        self._pending_progress_lines = ["Answer task started in the background."]
+        self._pending_ledger = [] if profile_name == "ledger" else None
+        self._ledger_progress_lines = self._pending_progress_lines
         self.set_busy(True)
-        try:
-            llm = OllamaLLM(
-                OllamaClient(
-                    self.config.ollama_base_url,
-                    timeout=self.config.ollama_timeout_seconds,
-                    allow_remote=self.config.ollama_allow_remote,
-                ),
-                self.selected_answer_model(),
-            )
-            profile_name = str(self.profile_combo.currentData())
-            answer_style = self.selected_answer_style()
-            searcher_profile = "standard" if profile_name == "ledger" else profile_name
-            searcher = build_rag_searcher(self.config, self.db, searcher_profile, llm)
-            answerer = StrictAnswerer(searcher, llm)
-            folder_paths = self.folder_scope.folder_paths() if self.folder_scope is not None else None
-            if profile_name == "ledger":
-                self._ledger_progress_lines = []
-                response = answerer.answer_with_evidence_ledger(
-                    self.investigation_id,
-                    question,
-                    history=history,
-                    folder_paths=folder_paths,
-                    progress_callback=self.show_ledger_progress,
-                    answer_style=answer_style,
-                )
-            else:
-                response = answerer.answer(
-                    self.investigation_id,
-                    question,
-                    history=history,
-                    folder_paths=folder_paths,
-                    answer_style=answer_style,
-                )
-        except Exception as exc:
-            QMessageBox.critical(self, "RAG", str(exc))
+        self.refresh_answer_view()
+        self.question_edit.clear()
+        self.start_ask_thread(
+            request_id,
+            self.investigation_id,
+            question,
+            history,
+            profile_name,
+            answer_style,
+            answer_model,
+            folder_paths,
+            source_types,
+        )
+
+    def start_ask_thread(
+        self,
+        request_id: int,
+        investigation_id: int,
+        question: str,
+        history: list[ConversationTurn],
+        profile_name: str,
+        answer_style: str,
+        answer_model: str,
+        folder_paths: list[str] | None,
+        source_types: list[str] | None,
+    ) -> None:
+        thread = QThread(self)
+        worker = RagAskWorker(
+            self.config,
+            request_id,
+            investigation_id,
+            question,
+            history,
+            profile_name,
+            answer_style,
+            answer_model,
+            folder_paths,
+            source_types,
+        )
+        self.ask_thread = thread
+        self.ask_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.apply_ask_progress)
+        worker.ledger_updated.connect(self.apply_ask_ledger)
+        worker.finished.connect(self.apply_ask_result)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self.ask_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def apply_ask_progress(self, request_id: int, message: str) -> None:
+        if request_id != self._ask_request_id:
             return
-        finally:
-            self.set_busy(False)
+        self._pending_progress_lines.append(message)
+        self._ledger_progress_lines = self._pending_progress_lines
+        self.refresh_answer_view()
+
+    def apply_ask_ledger(self, request_id: int, ledger: object) -> None:
+        if request_id != self._ask_request_id:
+            return
+        if isinstance(ledger, list):
+            self._pending_ledger = [dict(entry) for entry in ledger if isinstance(entry, dict)]
+            self.refresh_answer_view()
+
+    def apply_ask_result(self, result: RagAskResult) -> None:
+        if result.request_id != self._ask_request_id or result.investigation_id != self.investigation_id:
+            return
+        if result.error or result.response is None:
+            self._pending_question = ""
+            self._pending_progress_lines = []
+            self._pending_ledger = None
+            self.refresh_answer_view()
+            QMessageBox.critical(self, "RAG", result.error or "Answer task did not return a response.")
+            return
+        response = result.response
         self.turns.append(
             ChatExchange(
-                question=question,
+                question=result.question,
                 answer=response.answer,
                 results=response.results,
                 retrieval_query=response.retrieval_query,
@@ -349,10 +548,16 @@ class RagPanel(QWidget):
         )
         self.active_turn_index = len(self.turns) - 1
         self.results = response.results
-        self.answer_view.setHtml(self.render_conversation_html())
-        self.answer_view.verticalScrollBar().setValue(self.answer_view.verticalScrollBar().maximum())
+        self._pending_question = ""
+        self._pending_progress_lines = []
+        self._pending_ledger = None
+        self.refresh_answer_view()
         self.populate_citations()
-        self.question_edit.clear()
+
+    def ask_thread_finished(self) -> None:
+        self.ask_thread = None
+        self.ask_worker = None
+        self.set_busy(False)
 
     def selected_answer_model(self) -> str:
         data = self.answer_model_combo.currentData()
@@ -430,16 +635,20 @@ class RagPanel(QWidget):
 
     def shutdown(self, wait_ms: int = 3000) -> None:
         if self.model_thread is None or not self.model_thread.isRunning():
-            return
-        self.model_thread.quit()
-        self.model_thread.wait(wait_ms)
+            pass
+        else:
+            self.model_thread.quit()
+            self.model_thread.wait(wait_ms)
+        if self.ask_thread is not None and self.ask_thread.isRunning():
+            self._ask_request_id += 1
+            self.ask_thread.requestInterruption()
+            self.ask_thread.quit()
+            self.ask_thread.wait(wait_ms)
 
-    def show_ledger_progress(self, message: str) -> None:
-        self._ledger_progress_lines.append(message)
-        body = "<br>".join(html.escape(line) for line in self._ledger_progress_lines)
-        self.answer_view.setHtml(f"<html><body><p>{body}</p></body></html>")
+    def refresh_answer_view(self) -> None:
+        self.answer_view.setHtml(self.render_conversation_html())
         self.answer_view.verticalScrollBar().setValue(self.answer_view.verticalScrollBar().maximum())
-        QApplication.processEvents()
+        self.update_detail_panel()
 
     def save_conversation_pdf(self) -> None:
         if not self.turns:
@@ -466,7 +675,10 @@ class RagPanel(QWidget):
         QMessageBox.information(self, "Save to PDF", f"Conversation saved to:\n{file_path}")
 
     def render_conversation_html(self, for_export: bool = False) -> str:
-        body = "\n".join(self.render_turn_html(turn, index) for index, turn in enumerate(self.turns))
+        rendered_turns = [self.render_turn_html(turn, index, for_export=for_export) for index, turn in enumerate(self.turns)]
+        if not for_export and self._pending_question:
+            rendered_turns.append(self.render_pending_turn_html())
+        body = "\n".join(rendered_turns)
         return f"""
         <html>
           <head>
@@ -516,13 +728,26 @@ class RagPanel(QWidget):
         </html>
         """
 
-    def render_turn_html(self, turn: ChatExchange, turn_index: int) -> str:
+    def render_pending_turn_html(self) -> str:
+        question_html = self.render_plain_text(self._pending_question)
+        return f"""
+        <div class="turn user">
+          <div class="role">You</div>
+          <div class="message">{question_html}</div>
+        </div>
+        <div class="turn assistant">
+          <div class="role">Assistant</div>
+          <div class="message"><p>Working in the background...</p></div>
+        </div>
+        """
+
+    def render_turn_html(self, turn: ChatExchange, turn_index: int, for_export: bool = False) -> str:
         question_html = self.render_plain_text(turn.question)
-        answer_html = self.render_markdown_answer(turn.answer, turn.results, turn_index)
-        process_html = self.render_process_feedback_html(turn.process_feedback)
-        ledger_html = self.render_evidence_ledger_html(turn.evidence_ledger)
-        citation_html = self.render_citations_html(turn.results, turn_index)
-        if citation_html:
+        answer_html = self.render_markdown_answer(turn.answer, turn.results, turn_index, turn.evidence_ledger)
+        process_html = self.render_process_feedback_html(turn.process_feedback) if for_export else ""
+        ledger_html = self.render_evidence_ledger_html(turn.evidence_ledger) if for_export else ""
+        citation_html = self.render_citations_html(turn.results, turn_index) if for_export else ""
+        if for_export and citation_html:
             citation_html = f'<div class="citations"><div class="citation-title">Citations</div>{citation_html}</div>'
         return f"""
         <div class="turn user">
@@ -537,15 +762,12 @@ class RagPanel(QWidget):
         """
 
     def render_answer_html(self, answer: str) -> str:
-        linked_answer = self.render_markdown_answer(answer, self.results, self.active_turn_index)
-        citation_html = self.render_citations_html(self.results, self.active_turn_index)
-        if citation_html:
-            citation_html = f"<h3>Citations</h3>{citation_html}"
+        ledger = self.active_turn().evidence_ledger if self.active_turn() is not None else None
+        linked_answer = self.render_markdown_answer(answer, self.results, self.active_turn_index, ledger)
         return f"""
         <html>
           <body>
             <div>{linked_answer}</div>
-            {citation_html}
           </body>
         </html>
         """
@@ -559,8 +781,9 @@ class RagPanel(QWidget):
         answer: str,
         results: list[SearchResult] | None = None,
         turn_index: int | None = None,
+        ledger: list[dict[str, object]] | None = None,
     ) -> str:
-        markdown = self.link_answer_citations(answer, results or [], turn_index)
+        markdown = self.link_answer_citations(answer, results or [], turn_index, ledger)
         document = QTextDocument()
         document.setMarkdown(markdown)
         return self.html_body(document.toHtml())
@@ -570,15 +793,24 @@ class RagPanel(QWidget):
         answer: str,
         results: list[SearchResult],
         turn_index: int | None,
+        ledger: list[dict[str, object]] | None,
     ) -> str:
-        def replace(match: re.Match[str]) -> str:
+        def replace_ledger(match: re.Match[str]) -> str:
+            ledger_number = int(match.group(1))
+            row = ledger_number - 1
+            if ledger is not None and 0 <= row < len(ledger):
+                return f"[[E{ledger_number}]]({self.link_href('ledger', turn_index, row)})"
+            return match.group(0)
+
+        def replace_numeric(match: re.Match[str]) -> str:
             citation_number = int(match.group(1))
             row = citation_number - 1
             if 0 <= row < len(results):
-                return f"[[{citation_number}]]({self.link_href('source', turn_index, row)})"
+                return f"[[{citation_number}]]({self.link_href('chunk', turn_index, row)})"
             return match.group(0)
 
-        return CITATION_REF_RE.sub(replace, answer)
+        with_ledger_links = LEDGER_REF_RE.sub(replace_ledger, answer)
+        return CITATION_REF_RE.sub(replace_numeric, with_ledger_links)
 
     @staticmethod
     def html_body(document_html: str) -> str:
@@ -615,11 +847,12 @@ class RagPanel(QWidget):
         items = "".join(f"<li>{html.escape(item)}</li>" for item in feedback)
         return f'<div class="citations"><div class="citation-title">Process</div><ul>{items}</ul></div>'
 
-    def render_evidence_ledger_html(self, ledger: list[dict[str, object]] | None) -> str:
+    def render_evidence_ledger_html(self, ledger: list[dict[str, object]] | None, pending: bool = False) -> str:
         if ledger is None:
             return ""
         if not ledger:
-            return '<div class="citations"><div class="citation-title">Evidence ledger</div><p>No evidence entries were added.</p></div>'
+            message = "No evidence entries yet." if pending else "No evidence entries were added."
+            return f'<div class="citations"><div class="citation-title">Evidence ledger</div><p>{message}</p></div>'
         rows = []
         for index, entry in enumerate(ledger, start=1):
             claim = html.escape(str(entry.get("claim", "")))
@@ -667,6 +900,106 @@ class RagPanel(QWidget):
             self.chunk_preview.clear()
         self.update_citation_action_buttons()
 
+    def update_detail_panel(self, selected_ledger_row: int | None = None) -> None:
+        if self._pending_question:
+            process_feedback = self._pending_progress_lines
+            ledger = self._pending_ledger
+        else:
+            turn = self.active_turn()
+            process_feedback = turn.process_feedback if turn is not None else None
+            ledger = turn.evidence_ledger if turn is not None else None
+        self.populate_process_feedback(process_feedback)
+        self.populate_ledger_table(ledger, selected_ledger_row=selected_ledger_row)
+
+    def populate_process_feedback(self, feedback: list[str] | None) -> None:
+        if not feedback:
+            self.process_view.clear()
+            self.detail_tabs.setTabText(0, "Process")
+            return
+        self.process_view.setPlainText("\n".join(f"- {line}" for line in feedback))
+        self.detail_tabs.setTabText(0, f"Process ({len(feedback)})")
+
+    def populate_ledger_table(
+        self,
+        ledger: list[dict[str, object]] | None,
+        selected_ledger_row: int | None = None,
+    ) -> None:
+        self._updating_ledger_table = True
+        try:
+            rows = ledger or []
+            self.ledger_table.setRowCount(len(rows))
+            self.ledger_table.clearSelection()
+            for row, entry in enumerate(rows):
+                claim = str(entry.get("claim", "")).strip()
+                source = str(entry.get("source_path", "")).strip()
+                location = str(entry.get("source_location", "")).strip()
+                relevance = str(entry.get("why_relevant", "")).strip()
+                quote = str(entry.get("quoted_support", "")).strip()
+                source_text = "\n".join(part for part in (source, location) if part)
+                relevance_text = "\n".join(part for part in (relevance, quote) if part)
+                id_item = QTableWidgetItem(f"E{row + 1}")
+                id_item.setData(Qt.UserRole, str(entry.get("source_chunk_id", "")).strip())
+                self.ledger_table.setItem(row, 0, id_item)
+                self.ledger_table.setItem(row, 1, QTableWidgetItem(claim))
+                self.ledger_table.setItem(row, 2, QTableWidgetItem(source_text))
+                self.ledger_table.setItem(row, 3, QTableWidgetItem(relevance_text))
+            if rows and selected_ledger_row is not None:
+                self.ledger_table.selectRow(min(max(selected_ledger_row, 0), len(rows) - 1))
+            elif not rows:
+                self.ledger_table.clearSelection()
+            self.ledger_table.resizeRowsToContents()
+        finally:
+            self._updating_ledger_table = False
+        self.detail_tabs.setTabText(1, f"Evidence ledger ({len(ledger or [])})")
+
+    def active_turn(self) -> ChatExchange | None:
+        if self.active_turn_index is None:
+            return None
+        if self.active_turn_index < 0 or self.active_turn_index >= len(self.turns):
+            return None
+        return self.turns[self.active_turn_index]
+
+    def select_selected_ledger_source(self) -> None:
+        if self._updating_ledger_table or self._pending_question:
+            return
+        row = self.ledger_table.currentRow()
+        if row < 0 or self.active_turn_index is None:
+            return
+        self.select_ledger_entry(self.active_turn_index, row)
+
+    def select_ledger_entry(self, turn_index: int, ledger_row: int) -> None:
+        if turn_index < 0 or turn_index >= len(self.turns):
+            return
+        turn = self.turns[turn_index]
+        ledger = turn.evidence_ledger or []
+        if ledger_row < 0 or ledger_row >= len(ledger):
+            return
+        source_row = self.source_row_for_ledger_entry(turn, ledger_row)
+        self.active_turn_index = turn_index
+        self.results = turn.results
+        if source_row is not None:
+            self.populate_citations(source_row)
+            item = self.citation_table.item(source_row, 0)
+            if item is not None:
+                self.citation_table.scrollToItem(item)
+            self.update_chunk_preview()
+        else:
+            self.populate_citations(0)
+        self.update_detail_panel(selected_ledger_row=ledger_row)
+
+    @staticmethod
+    def source_row_for_ledger_entry(turn: ChatExchange, ledger_row: int) -> int | None:
+        ledger = turn.evidence_ledger or []
+        if ledger_row < 0 or ledger_row >= len(ledger):
+            return None
+        chunk_id = str(ledger[ledger_row].get("source_chunk_id", "")).strip()
+        if not chunk_id:
+            return None
+        for row, result in enumerate(turn.results):
+            if result.chunk_id == chunk_id:
+                return row
+        return None
+
     def selected_result(self) -> SearchResult | None:
         row = self.citation_table.currentRow()
         if row < 0 or row >= len(self.results):
@@ -682,6 +1015,7 @@ class RagPanel(QWidget):
         self.active_turn_index = turn_index
         self.results = results
         self.populate_citations(row)
+        self.update_detail_panel()
         item = self.citation_table.item(row, 0)
         if item is not None:
             self.citation_table.scrollToItem(item)
@@ -704,6 +1038,9 @@ class RagPanel(QWidget):
         if target is None:
             return
         turn_index, row = target
+        if action == "ledger":
+            self.select_ledger_entry(turn_index, row)
+            return
         result = self.result_for_link(turn_index, row)
         if result is None:
             return

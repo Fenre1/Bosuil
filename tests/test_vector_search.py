@@ -45,10 +45,10 @@ class FakeEmbeddings:
 
 
 class FakeStore:
-    def search(self, vector, investigation_id, embedding_model="", limit=10, oversample=3):
+    def search(self, vector, investigation_id, embedding_model="", limit=10, oversample=3, source_types=None):
         return []
 
 
 class FakeDB:
-    def get_chunks_by_ids_in_folders(self, chunk_ids, folder_paths, active_only=True):
+    def get_chunks_by_ids_in_folders(self, chunk_ids, folder_paths, source_types=None, active_only=True):
         return []

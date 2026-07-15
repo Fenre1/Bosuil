@@ -40,10 +40,22 @@ class LanceDBStore:
             db.create_table(self.table_name, data=records)
             return
         table = db.open_table(self.table_name)
+        self._drop_deprecated_text_column(table)
         for record in records:
             chunk_id = str(record["chunk_id"]).replace("'", "''")
             table.delete(f"chunk_id = '{chunk_id}'")
         table.add(records)
+
+    @staticmethod
+    def _drop_deprecated_text_column(table: Any) -> None:
+        field_names = set(table.schema.names)
+        if "text" not in field_names:
+            return
+        if not hasattr(table, "drop_columns"):
+            raise LanceDBUnavailable(
+                "LanceDB table contains deprecated raw text. Upgrade LanceDB or rebuild the vector store."
+            )
+        table.drop_columns(["text"])
 
     def search(
         self,
@@ -52,7 +64,10 @@ class LanceDBStore:
         embedding_model: str = "",
         limit: int = 10,
         oversample: int = 3,
+        source_types: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        if source_types == []:
+            return []
         if not self.has_table():
             return []
         table = self._connect().open_table(self.table_name)
@@ -61,6 +76,18 @@ class LanceDBStore:
         if embedding_model:
             safe_model = embedding_model.replace("'", "''")
             where_clause += f" AND embedding_model = '{safe_model}'"
+        if source_types is not None:
+            normalized = sorted(
+                {
+                    str(source_type).strip().lower().lstrip(".")
+                    for source_type in source_types
+                    if str(source_type).strip()
+                }
+            )
+            if not normalized:
+                return []
+            safe_types = ", ".join("'" + source_type.replace("'", "''") + "'" for source_type in normalized)
+            where_clause += f" AND source_type IN ({safe_types})"
         try:
             rows = (
                 table.search(vector)

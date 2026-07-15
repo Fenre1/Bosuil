@@ -25,8 +25,9 @@ class VectorSearcher:
         query: str,
         limit: int = 20,
         folder_paths: list[str] | None = None,
+        source_types: list[str] | None = None,
     ) -> list[SearchResult]:
-        if folder_paths == []:
+        if folder_paths == [] or source_types == []:
             return []
         query_vector = self.embeddings.embed_texts([format_embedding_query(query, self.query_instruction)])[0]
         vector_rows = self.store.search(
@@ -34,10 +35,16 @@ class VectorSearcher:
             investigation_id=investigation_id,
             embedding_model=self.embeddings.model,
             limit=limit,
-            oversample=8 if folder_paths is not None else 3,
+            oversample=8 if folder_paths is not None or source_types is not None else 3,
+            source_types=source_types,
         )
         chunk_ids = [str(row["chunk_id"]) for row in vector_rows if row.get("chunk_id")]
-        db_rows = self.db.get_chunks_by_ids_in_folders(chunk_ids, folder_paths, active_only=True)
+        db_rows = self.db.get_chunks_by_ids_in_folders(
+            chunk_ids,
+            folder_paths,
+            source_types=source_types,
+            active_only=True,
+        )
         distances = {str(row["chunk_id"]): float(row.get("_distance", 0.0)) for row in vector_rows}
         return [
             row_to_result(row, score=1.0 / (1.0 + distances.get(str(row["id"]), 0.0)))

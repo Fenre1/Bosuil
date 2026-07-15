@@ -15,9 +15,11 @@ class OllamaClient:
     base_url: str
     timeout: int = 120
     allow_remote: bool = False
+    num_ctx: int = 0
 
     def __post_init__(self) -> None:
         self.base_url = validate_ollama_base_url(self.base_url, allow_remote=self.allow_remote)
+        self.num_ctx = self.num_ctx if self.num_ctx > 0 else 0
 
     def embed(self, model: str, texts: list[str]) -> list[list[float]]:
         if not model:
@@ -100,11 +102,15 @@ class OllamaClient:
         if not model:
             raise OllamaError("OLLAMA_LLM_MODEL is not configured.")
 
+        request_json: dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+        if self.num_ctx:
+            request_json["options"] = {"num_ctx": self.num_ctx}
+
         try:
             response = self._request(
                 "POST",
                 "/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False},
+                json=request_json,
             )
             response.raise_for_status()
             payload = response.json()

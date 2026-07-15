@@ -31,6 +31,33 @@ def test_keyword_search_can_be_limited_to_selected_folder(tmp_path):
     assert none_selected == []
 
 
+def test_keyword_search_can_be_limited_to_selected_file_types(tmp_path):
+    db = SQLiteDB(tmp_path / "app.sqlite")
+    db.initialize()
+    root = tmp_path / "case"
+    investigation_id = db.create_investigation("case", [root])
+    pdf_file = root / "report.pdf"
+    txt_file = root / "notes.txt"
+    pdf_id = insert_file(db, investigation_id, pdf_file, source_type="pdf")
+    txt_id = insert_file(db, investigation_id, txt_file, source_type="txt")
+    db.insert_chunks(
+        [
+            chunk(investigation_id, pdf_id, pdf_file, "pdf", "payment from pdf", source_type="pdf"),
+            chunk(investigation_id, txt_id, txt_file, "txt", "payment from txt", source_type="txt"),
+        ]
+    )
+
+    searcher = KeywordSearcher(db)
+
+    pdf_only = searcher.search(investigation_id, "payment", source_types=["pdf"])
+    mixed = searcher.search(investigation_id, "payment", source_types=[".pdf", "txt"])
+    none_selected = searcher.search(investigation_id, "payment", source_types=[])
+
+    assert [result.path for result in pdf_only] == [str(pdf_file)]
+    assert {result.path for result in mixed} == {str(pdf_file), str(txt_file)}
+    assert none_selected == []
+
+
 def test_active_chunks_for_investigation_returns_active_file_chunks(tmp_path):
     db = SQLiteDB(tmp_path / "app.sqlite")
     db.initialize()
@@ -96,7 +123,7 @@ def test_keyword_search_returns_display_markdown(tmp_path):
     assert results[0].display_markdown == "# Important heading"
 
 
-def insert_file(db: SQLiteDB, investigation_id: int, path: Path) -> int:
+def insert_file(db: SQLiteDB, investigation_id: int, path: Path, source_type: str = "txt") -> int:
     return db.upsert_file(
         investigation_id=investigation_id,
         path=path,
@@ -105,7 +132,7 @@ def insert_file(db: SQLiteDB, investigation_id: int, path: Path) -> int:
         size=10,
         modified_ns=1,
         content_hash=f"hash-{path.parent.name}",
-        source_type="txt",
+        source_type=source_type,
     )
 
 
@@ -117,6 +144,7 @@ def chunk(
     text: str,
     chunk_index: int = 0,
     display_markdown: str | None = None,
+    source_type: str = "txt",
 ) -> dict[str, object]:
     return {
         "id": f"chunk-{suffix}",
@@ -127,7 +155,7 @@ def chunk(
         "chunk_text": text,
         "display_markdown": display_markdown,
         "chunk_text_hash": f"text-hash-{suffix}",
-        "source_type": "txt",
+        "source_type": source_type,
         "page_number": None,
         "email_subject": None,
         "email_sender": None,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from investigation_rag.rag.ollama_llm import OllamaLLM
+from investigation_rag.rag.token_estimation import format_prompt_token_estimate
 
 
 QUERY_EXPANSION_INSTRUCTIONS = """Generate concise retrieval queries for a local investigation archive.
@@ -17,6 +18,7 @@ class QueryExpander:
     def __init__(self, llm: OllamaLLM, max_queries: int = 4):
         self.llm = llm
         self.max_queries = max_queries
+        self.last_prompt_estimate = ""
 
     def expand(self, question: str) -> list[str]:
         prompt = (
@@ -24,6 +26,7 @@ class QueryExpander:
             f"Question:\n{question}\n\n"
             f"Return up to {self.max_queries} retrieval queries:"
         )
+        self.last_prompt_estimate = format_prompt_token_estimate("Query expansion", prompt)
         try:
             response = self.llm.answer(prompt)
         except Exception:

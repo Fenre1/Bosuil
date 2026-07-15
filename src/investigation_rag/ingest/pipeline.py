@@ -433,7 +433,6 @@ class ScanPipeline:
                     "file_id": int(record["file_id"]),
                     "path": str(record["path"]),
                     "source_type": str(record["source_type"]),
-                    "text": str(record.get("searchable_text") or record["chunk_text"]),
                     "is_active": True,
                     "embedding_model": self.config.ollama_embed_model,
                     "vector": vector,

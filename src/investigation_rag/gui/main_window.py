@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
 from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
+from investigation_rag.gui.file_type_scope import FileTypeScope, FileTypeScopePanel
 from investigation_rag.gui.files_panel import FilesPanel
 from investigation_rag.gui.folder_scope import FolderScope, FolderScopePanel
 from investigation_rag.gui.investigation_dialog import InvestigationDialog
@@ -78,6 +79,7 @@ class MainWindow(QMainWindow):
         self.db = db
         self.store = store
         self.folder_scope = FolderScope()
+        self.file_type_scope = FileTypeScope()
         self._active_investigation_id: int | None = None
         self._loading_investigation_id: int | None = None
         self.setWindowTitle("Bosuil, de lokale antwoordvogel")
@@ -104,6 +106,8 @@ class MainWindow(QMainWindow):
 
         title = QLabel("Bosuil, de lokale antwoordvogel")
         title.setObjectName("AppTitle")
+        self.header_investigation_label = QLabel("")
+        self.header_investigation_label.setObjectName("HeaderInvestigationName")
 
         top = QHBoxLayout()
         top.setContentsMargins(18, 14, 18, 16)
@@ -112,6 +116,7 @@ class MainWindow(QMainWindow):
         if title_icon is not None:
             top.addWidget(title_icon)
         top.addWidget(title)
+        top.addWidget(self.header_investigation_label)
         top.addStretch(1)
 
         header = QWidget()
@@ -127,13 +132,15 @@ class MainWindow(QMainWindow):
         self.scan_panel.scan_button.clicked.connect(self.scan_selected_investigation)
         self.scan_panel.set_investigation_selector(self.build_investigation_selector())
         self.folder_scope_panel = FolderScopePanel(db, self.folder_scope)
+        self.file_type_scope_panel = FileTypeScopePanel(self.file_type_scope)
+        self.filters_panel = self.build_filters_panel()
         self.files_panel = FilesPanel(db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
         self.files_panel.load_started.connect(self.on_investigation_data_load_started)
         self.files_panel.load_finished.connect(self.on_investigation_data_load_finished)
-        self.search_panel = SearchPanel(config, db, store, self.folder_scope)
-        self.rag_panel = RagPanel(config, db, store, self.folder_scope)
+        self.search_panel = SearchPanel(config, db, store, self.folder_scope, self.file_type_scope)
+        self.rag_panel = RagPanel(config, db, store, self.folder_scope, self.file_type_scope)
         self.tabs.addTab(self.scan_panel, "Onderzoeken")
-        self.tabs.addTab(self.folder_scope_panel, "Mappen")
+        self.tabs.addTab(self.filters_panel, "Filters")
         self.tabs.addTab(self.files_panel, "Bestanden")
         self.tabs.addTab(self.search_panel, "Zoeken")
         self.tabs.addTab(self.rag_panel, "De Uil Antwoord")
@@ -149,6 +156,18 @@ class MainWindow(QMainWindow):
 
         self.reload_investigations()
         self.on_investigation_changed()
+
+    def build_filters_panel(self) -> QWidget:
+        self.file_type_scope_panel.layout().setContentsMargins(0, 0, 0, 0)
+        self.folder_scope_panel.layout().setContentsMargins(0, 0, 0, 0)
+
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(12)
+        layout.addWidget(self.file_type_scope_panel)
+        layout.addWidget(self.folder_scope_panel, 1)
+        return panel
 
     def build_title_icon(self) -> QLabel | None:
         icon_path = app_icon_path()
@@ -261,6 +280,7 @@ class MainWindow(QMainWindow):
         for panel in (
             self.scan_panel,
             self.folder_scope_panel,
+            self.file_type_scope_panel,
             self.files_panel,
             self.search_panel,
             self.rag_panel,
@@ -289,11 +309,13 @@ class MainWindow(QMainWindow):
             if is_loaded:
                 loaded_name = item.text()
         if loaded_name:
+            self.header_investigation_label.setText(f"Investigation: {loaded_name}")
             if self._loading_investigation_id == loaded_id:
                 self.loaded_investigation_label.setText(f"Loading data for: {loaded_name}...")
             else:
                 self.loaded_investigation_label.setText(f"Loaded: {loaded_name}")
         else:
+            self.header_investigation_label.setText("")
             self.loaded_investigation_label.setText("No investigation loaded")
 
     def on_investigation_data_load_started(self, investigation_id: int) -> None:

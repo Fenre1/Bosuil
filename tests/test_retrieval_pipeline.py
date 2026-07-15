@@ -52,6 +52,13 @@ def test_pipeline_retrieves_broadly_but_returns_compact_final_pack():
     assert keyword.limits == [64]
     assert vector.limits == [64]
     assert {item.chunk_id for item in packed} <= {"strong", "support", "weak"}
+    assert [step.label for step in pipeline.last_timing_steps] == [
+        "Keyword retrieval",
+        "Vector retrieval",
+        "Result fusion",
+        "Rerank",
+        "Retrieval total",
+    ]
 
 
 def test_pipeline_passes_folder_scope_to_retrievers():
@@ -73,6 +80,54 @@ def test_pipeline_passes_folder_scope_to_retrievers():
     assert vector.folder_paths == [["C:/case/a"]]
 
 
+def test_pipeline_passes_file_type_scope_to_retrievers():
+    profile = RetrievalProfile(
+        name="test",
+        keyword_candidates=2,
+        vector_candidates=3,
+        fusion_candidates=4,
+        rerank_candidates=4,
+        final_answer_chunks=2,
+    )
+    keyword = ScopedFakeSearcher([result("keyword")])
+    vector = ScopedFakeSearcher([result("vector")])
+    pipeline = RetrievalPipeline(keyword, vector, db=FakeDB(), profile=profile)
+
+    pipeline.search(1, "payment", source_types=["pdf"])
+
+    assert keyword.source_types == [["pdf"]]
+    assert vector.source_types == [["pdf"]]
+
+
+def test_pipeline_records_deep_retrieval_timing_steps():
+    profile = RetrievalProfile(
+        name="deep-test",
+        keyword_candidates=2,
+        vector_candidates=2,
+        fusion_candidates=4,
+        rerank_candidates=4,
+        final_answer_chunks=2,
+        query_expansion_enabled=True,
+        context_expansion_enabled=True,
+    )
+    keyword = FakeSearcher([result("keyword")])
+    vector = FakeSearcher([result("vector")])
+    pipeline = RetrievalPipeline(keyword, vector, db=FakeDB(), profile=profile, query_expander=FakeExpander())
+
+    pipeline.search(1, "payment")
+
+    assert pipeline.last_process_feedback == ["Query expansion prompt estimate: ~10 tokens (40 prompt chars)."]
+    assert [step.label for step in pipeline.last_timing_steps] == [
+        "Query expansion",
+        "Keyword retrieval (2 queries)",
+        "Vector retrieval (2 queries)",
+        "Result fusion",
+        "Rerank",
+        "Context expansion",
+        "Retrieval total",
+    ]
+
+
 class FakeSearcher:
     def __init__(self, results):
         self.results = results
@@ -87,11 +142,21 @@ class ScopedFakeSearcher:
     def __init__(self, results):
         self.results = results
         self.folder_paths = []
+        self.source_types = []
 
-    def search(self, investigation_id, query, limit, folder_paths=None):
+    def search(self, investigation_id, query, limit, folder_paths=None, source_types=None):
         self.folder_paths.append(folder_paths)
+        self.source_types.append(source_types)
         return self.results
 
 
 class FakeDB:
-    pass
+    def get_neighbor_chunks(self, file_id, chunk_index, before=1, after=1, source_types=None):
+        return []
+
+
+class FakeExpander:
+    last_prompt_estimate = "Query expansion prompt estimate: ~10 tokens (40 prompt chars)."
+
+    def expand(self, query):
+        return [query, f"{query} date"]
