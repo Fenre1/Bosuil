@@ -33,9 +33,7 @@ class SearchResult:
 
     @property
     def locator(self) -> str:
-        if self.page_number:
-            return f"{self.path} page {self.page_number}"
-        return f"{self.path} chunk {self.chunk_index + 1}"
+        return f"{self.path} {result_location_label(self)}"
 
 
 def row_to_result(row: Any, score: float = 0.0) -> SearchResult:
@@ -79,3 +77,35 @@ def _optional_row_value(row: Any, key: str) -> Any:
     if key not in keys:
         return None
     return row[key]
+
+
+def result_location_label(result: SearchResult) -> str:
+    metadata = result.metadata or {}
+    page_start = _optional_int(metadata.get("page_start"))
+    page_end = _optional_int(metadata.get("page_end"))
+    pages = metadata.get("pages")
+    if page_start and page_end:
+        if page_start == page_end:
+            return f"page {page_start}"
+        return f"pages {page_start}-{page_end}"
+    if isinstance(pages, list) and pages:
+        page_numbers = [_optional_int(page) for page in pages]
+        page_numbers = [page for page in page_numbers if page]
+        if page_numbers:
+            first = min(page_numbers)
+            last = max(page_numbers)
+            if first == last:
+                return f"page {first}"
+            if page_numbers == list(range(first, last + 1)):
+                return f"pages {first}-{last}"
+            return "pages " + ", ".join(str(page) for page in page_numbers)
+    if result.page_number:
+        return f"page {result.page_number}"
+    return f"chunk {result.chunk_index + 1}"
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

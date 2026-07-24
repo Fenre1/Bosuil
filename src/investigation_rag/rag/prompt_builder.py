@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 
 from investigation_rag.rag.citations import citation_label
-from investigation_rag.retrieval.ranking import SearchResult
+from investigation_rag.retrieval.ranking import SearchResult, result_location_label
 
 
 STRICT_SYSTEM_INSTRUCTIONS = """You are a local investigation assistant.
@@ -334,6 +334,4 @@ def truncate_text(value: str, max_chars: int) -> str:
 
 
 def location_label(result: SearchResult) -> str:
-    if result.page_number:
-        return f"page {result.page_number}"
-    return f"chunk {result.chunk_index + 1}"
+    return result_location_label(result)

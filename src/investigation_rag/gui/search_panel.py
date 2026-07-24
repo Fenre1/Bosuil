@@ -41,7 +41,7 @@ from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.retrieval.keyword_search import query_terms
-from investigation_rag.retrieval.ranking import SearchResult
+from investigation_rag.retrieval.ranking import SearchResult, result_location_label
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
 
 
@@ -646,8 +646,9 @@ def result_match_subtitle(result: SearchResult) -> str:
 
 
 def result_match_title(result: SearchResult) -> str:
-    if result.page_number:
-        return f"Page {result.page_number}"
+    location = result_location_label(result)
+    if location.startswith("page"):
+        return location.capitalize()
     if result.source_type == "msg":
         return "Email match"
     if result.attachment_name:
@@ -802,8 +803,9 @@ def grouped_results(results: list[SearchResult]) -> list[list[tuple[int, SearchR
 
 
 def result_location(result: SearchResult) -> str:
-    if result.page_number:
-        return f"Page {result.page_number}, chunk {result.chunk_index + 1}"
+    location = result_location_label(result)
+    if location.startswith("page"):
+        return f"{location.capitalize()}, chunk {result.chunk_index + 1}"
     return f"Chunk {result.chunk_index + 1}"
 
 
@@ -812,8 +814,9 @@ def result_context_label(result: SearchResult) -> str:
         return result.email_subject
     if result.attachment_name:
         return f"attachment: {result.attachment_name}"
-    if result.page_number:
-        return f"page {result.page_number}"
+    location = result_location_label(result)
+    if location.startswith("page"):
+        return location
     return ""
 
 
@@ -891,6 +894,8 @@ def metadata_items(result: SearchResult) -> tuple[str, list[tuple[str, str]]]:
         if value not in (None, ""):
             rows.append((metadata_label(key), format_metadata_value(key, value)))
     for key in sorted(metadata):
+        if key in hidden_metadata_keys():
+            continue
         value = metadata[key]
         if value not in (None, ""):
             rows.append((metadata_label(key), format_metadata_value(key, value)))
@@ -956,7 +961,13 @@ def metadata_keys_for_type(source_type: str) -> list[str]:
     common = ["filename", "file_type", "path"]
     if source_type == "pdf":
         return common + [
+            "page_start",
+            "page_end",
+            "pages",
             "page_number",
+            "heading_path_text",
+            "content_type",
+            "contains_figure",
             "page_count",
             "title",
             "author",
@@ -985,14 +996,32 @@ def metadata_keys_for_type(source_type: str) -> list[str]:
     return common + ["size_bytes", "modified_ns", "attachment_name", "parent_email_subject", "parent_email_sender"]
 
 
+def hidden_metadata_keys() -> set[str]:
+    return {
+        "heading_path",
+        "source_spans",
+        "retrieval_prefix",
+        "retrieval_prefix_char_count",
+        "overlap_source_spans",
+        "pdf_chunk_debug",
+        "raw_text",
+        "layout_blocks",
+        "pdf_layout_version",
+    }
+
+
 def metadata_label(key: str) -> str:
     labels = {
         "cc": "CC",
         "docx": "DOCX",
         "file_type": "Type",
         "modified_ns": "Modified",
+        "content_type": "Content type",
+        "heading_path_text": "Section",
         "page_count": "Pages",
         "page_number": "Page",
+        "page_start": "Page start",
+        "page_end": "Page end",
         "parent_email_sender": "Parent sender",
         "parent_email_subject": "Parent subject",
         "size_bytes": "Size",

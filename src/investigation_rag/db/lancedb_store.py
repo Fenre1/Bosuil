@@ -41,10 +41,22 @@ class LanceDBStore:
             return
         table = db.open_table(self.table_name)
         self._drop_deprecated_text_column(table)
-        for record in records:
-            chunk_id = str(record["chunk_id"]).replace("'", "''")
-            table.delete(f"chunk_id = '{chunk_id}'")
+        chunk_ids = list(dict.fromkeys(str(record["chunk_id"]) for record in records))
+        for start in range(0, len(chunk_ids), 500):
+            batch = chunk_ids[start : start + 500]
+            values = ", ".join("'" + chunk_id.replace("'", "''") + "'" for chunk_id in batch)
+            table.delete(f"chunk_id IN ({values})")
         table.add(records)
+
+    def optimize(self) -> bool:
+        if not self.has_table():
+            return False
+        table = self._connect().open_table(self.table_name)
+        optimize = getattr(table, "optimize", None)
+        if not callable(optimize):
+            return False
+        optimize()
+        return True
 
     @staticmethod
     def _drop_deprecated_text_column(table: Any) -> None:

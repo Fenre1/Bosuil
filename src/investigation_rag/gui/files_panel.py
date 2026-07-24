@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -28,7 +29,7 @@ class FilesLoadResult:
     investigation_id: int
     roots: list[Path]
     files: list[dict]
-    chunks: list[dict]
+    query_seconds: float = 0.0
     error: str = ""
 
 
@@ -37,10 +38,11 @@ class TreePopulateState:
     request_id: int
     roots: list[Path]
     files: list[dict]
-    chunks_by_file_id: dict[int, list[dict]]
     root_items: dict[str, QTreeWidgetItem]
     items_by_path: dict[str, QTreeWidgetItem]
     next_file_index: int = 0
+    folder_lookup_seconds: float = 0.0
+    widget_seconds: float = 0.0
 
 
 class FilesLoadWorker(QObject):
@@ -54,16 +56,26 @@ class FilesLoadWorker(QObject):
         self.request_id = request_id
 
     def run(self) -> None:
+        started = perf_counter()
         try:
             roots = self.db.get_roots(self.investigation_id)
-            files = [dict(row) for row in self.db.active_files_for_investigation(self.investigation_id)]
-            if self.lazy_load_chunk_text:
-                chunks = [dict(row) for row in self.db.active_chunk_summaries_for_investigation(self.investigation_id)]
-            else:
-                chunks = [dict(row) for row in self.db.active_chunks_for_investigation(self.investigation_id)]
-            result = FilesLoadResult(self.request_id, self.investigation_id, roots, files, chunks)
+            files = [dict(row) for row in self.db.file_browser_files_for_investigation(self.investigation_id)]
+            result = FilesLoadResult(
+                self.request_id,
+                self.investigation_id,
+                roots,
+                files,
+                query_seconds=perf_counter() - started,
+            )
         except Exception as exc:
-            result = FilesLoadResult(self.request_id, self.investigation_id, [], [], [], str(exc))
+            result = FilesLoadResult(
+                self.request_id,
+                self.investigation_id,
+                [],
+                [],
+                query_seconds=perf_counter() - started,
+                error=str(exc),
+            )
         self.finished.emit(result)
 
 
@@ -85,10 +97,14 @@ class FilesPanel(QWidget):
         self._load_request_id = 0
         self._reload_pending = False
         self._populate_state: TreePopulateState | None = None
+        self._load_started_at: float | None = None
+        self._populate_started_at: float | None = None
+        self.last_load_timing: dict[str, float | int] = {}
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["File / chunk", "Type", "Details"])
         self.tree.itemSelectionChanged.connect(self.update_preview)
+        self.tree.itemExpanded.connect(self.load_file_chunks)
 
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
@@ -137,6 +153,7 @@ class FilesPanel(QWidget):
             return
 
         self.set_loading(True, "Loading files and chunks...")
+        self._load_started_at = perf_counter()
         self.load_started.emit(self.investigation_id)
         if self.load_thread is not None:
             self._reload_pending = True
@@ -185,10 +202,11 @@ class FilesPanel(QWidget):
         self.start_load_thread(self.investigation_id, self._load_request_id)
 
     def start_tree_population(self, result: FilesLoadResult) -> None:
-        chunks_by_file_id: dict[int, list] = {}
-        for chunk in result.chunks:
-            chunks_by_file_id.setdefault(int(chunk["file_id"]), []).append(chunk)
-
+        self._populate_started_at = perf_counter()
+        self.last_load_timing = {
+            "query_seconds": result.query_seconds,
+            "file_count": len(result.files),
+        }
         root_items: dict[str, QTreeWidgetItem] = {}
         items_by_path: dict[str, QTreeWidgetItem] = {}
         self.tree.clear()
@@ -207,7 +225,6 @@ class FilesPanel(QWidget):
             request_id=result.request_id,
             roots=result.roots,
             files=files,
-            chunks_by_file_id=chunks_by_file_id,
             root_items=root_items,
             items_by_path=items_by_path,
         )
@@ -223,10 +240,12 @@ class FilesPanel(QWidget):
         try:
             for file_row in state.files[state.next_file_index:end_index]:
                 file_path = Path(str(file_row["path"]))
+                phase_started = perf_counter()
                 parent = self.ensure_folder_item(file_path.parent, state.roots, state.root_items, state.items_by_path)
-                file_item = self.add_file_item(parent, file_row)
-                for chunk in state.chunks_by_file_id.get(int(file_row["id"]), []):
-                    self.add_chunk_item(file_item, chunk)
+                state.folder_lookup_seconds += perf_counter() - phase_started
+                phase_started = perf_counter()
+                self.add_file_item(parent, file_row)
+                state.widget_seconds += perf_counter() - phase_started
         finally:
             self.tree.setUpdatesEnabled(True)
 
@@ -237,9 +256,20 @@ class FilesPanel(QWidget):
             return
 
         self.tree.expandToDepth(0)
-        self.tree.resizeColumnToContents(0)
-        chunk_count = sum(len(chunks) for chunks in state.chunks_by_file_id.values())
+        self.tree.setColumnWidth(0, 360)
+        chunk_count = sum(int(file_row["active_chunk_count"]) for file_row in state.files)
         self._populate_state = None
+        populate_seconds = perf_counter() - self._populate_started_at if self._populate_started_at is not None else 0.0
+        total_seconds = perf_counter() - self._load_started_at if self._load_started_at is not None else populate_seconds
+        self.last_load_timing.update(
+            {
+                "populate_seconds": populate_seconds,
+                "folder_lookup_seconds": state.folder_lookup_seconds,
+                "widget_seconds": state.widget_seconds,
+                "total_seconds": total_seconds,
+                "chunk_count": chunk_count,
+            }
+        )
         self.set_loading(False)
         self.update_status(len(state.files), chunk_count)
         if self.investigation_id is not None:
@@ -258,6 +288,7 @@ class FilesPanel(QWidget):
             file_path = Path(str(file_row["path"]))
             parent = self.ensure_folder_item(file_path.parent, roots, root_items, items_by_path)
             file_item = self.add_file_item(parent, file_row)
+            file_item.takeChildren()
             for chunk in chunks_by_file_id.get(int(file_row["id"]), []):
                 self.add_chunk_item(file_item, chunk)
 
@@ -268,12 +299,15 @@ class FilesPanel(QWidget):
         root_items: dict[str, QTreeWidgetItem],
         items_by_path: dict[str, QTreeWidgetItem],
     ) -> QTreeWidgetItem | QTreeWidget:
+        folder_key = FolderScopePanel.path_key(folder)
+        existing_item = items_by_path.get(folder_key)
+        if existing_item is not None:
+            return existing_item
         root = FolderScopePanel.best_root(folder, roots)
         if root is None:
-            key = FolderScopePanel.path_key(folder)
-            if key not in items_by_path:
-                items_by_path[key] = self.add_folder_item(self.tree, str(folder), folder)
-            return items_by_path[key]
+            item = self.add_folder_item(self.tree, str(folder), folder)
+            items_by_path[folder_key] = item
+            return item
 
         parent = root_items[FolderScopePanel.path_key(root)]
         current = root
@@ -299,13 +333,51 @@ class FilesPanel(QWidget):
 
     def add_file_item(self, parent: QTreeWidget | QTreeWidgetItem, file_row) -> QTreeWidgetItem:
         path = str(file_row["path"])
+        chunk_count = int(file_row["active_chunk_count"])
         item = QTreeWidgetItem(parent)
         item.setText(0, Path(path).name)
         item.setText(1, str(file_row["source_type"]))
-        item.setText(2, str(file_row["extraction_status"]))
-        item.setData(0, Qt.UserRole, {"kind": "file", "path": path})
+        item.setText(2, f"{file_row['extraction_status']}; {chunk_count} chunks")
+        item.setData(
+            0,
+            Qt.UserRole,
+            {
+                "kind": "file",
+                "file_id": int(file_row["id"]),
+                "path": path,
+                "chunks_loaded": chunk_count == 0,
+            },
+        )
         item.setToolTip(0, path)
+        if chunk_count:
+            placeholder = QTreeWidgetItem(item)
+            placeholder.setText(0, f"{chunk_count} chunks — expand to load")
+            placeholder.setText(1, "loading")
         return item
+
+    def load_file_chunks(self, item: QTreeWidgetItem) -> None:
+        data = item.data(0, Qt.UserRole)
+        if not isinstance(data, dict) or data.get("kind") != "file" or data.get("chunks_loaded"):
+            return
+        file_id = data.get("file_id")
+        if not isinstance(file_id, int):
+            return
+        try:
+            if self.lazy_load_chunk_text:
+                chunks = self.db.active_chunk_summaries_for_file(file_id)
+            else:
+                chunks = self.db.active_chunks_for_file(file_id)
+        except Exception as exc:
+            item.takeChildren()
+            error_item = QTreeWidgetItem(item)
+            error_item.setText(0, f"Could not load chunks: {exc}")
+            error_item.setText(1, "error")
+            return
+        item.takeChildren()
+        for chunk in chunks:
+            self.add_chunk_item(item, chunk)
+        data["chunks_loaded"] = True
+        item.setData(0, Qt.UserRole, data)
 
     def add_chunk_item(self, parent: QTreeWidgetItem, chunk) -> QTreeWidgetItem:
         item = QTreeWidgetItem(parent)
@@ -320,6 +392,7 @@ class FilesPanel(QWidget):
                 "chunk_id": str(chunk["id"]),
                 "path": str(chunk["path"]),
                 "text": None if self.lazy_load_chunk_text else str(chunk["chunk_text"]),
+                "markdown": None,
             },
         )
         item.setToolTip(0, "Click to show chunk content")
@@ -331,6 +404,7 @@ class FilesPanel(QWidget):
             self.preview.clear()
             return
         text = data.get("text")
+        markdown = data.get("markdown")
         if text is None:
             chunk_id = data.get("chunk_id")
             if not isinstance(chunk_id, str):
@@ -341,11 +415,13 @@ class FilesPanel(QWidget):
                 self.preview.setPlainText("Chunk text is no longer available.")
                 return
             text = str(chunk["chunk_text"])
+            markdown = chunk["display_markdown"]
             data["text"] = text
+            data["markdown"] = markdown
             item = self.tree.currentItem()
             if item is not None:
                 item.setData(0, Qt.UserRole, data)
-        self.preview.setPlainText(str(text))
+        set_chunk_preview_text(self.preview, markdown if isinstance(markdown, str) else None, str(text))
 
     def selected_item_data(self) -> dict | None:
         item = self.tree.currentItem()
@@ -410,3 +486,12 @@ class FilesPanel(QWidget):
         if chunk["attachment_name"]:
             return f"attachment: {chunk['attachment_name']}"
         return ""
+
+
+def set_chunk_preview_text(preview: QTextEdit, display_markdown: str | None, plain_text: str) -> None:
+    if display_markdown:
+        set_markdown = getattr(preview, "setMarkdown", None)
+        if callable(set_markdown):
+            set_markdown(display_markdown)
+            return
+    preview.setPlainText(plain_text)

@@ -29,6 +29,7 @@ from investigation_rag.retrieval.pipeline import RetrievalPipeline
 from investigation_rag.retrieval.profiles import profile_from_config
 from investigation_rag.retrieval.query_expansion import QueryExpander
 from investigation_rag.retrieval.vector_search import VectorSearcher
+from investigation_rag.workspace import InvestigationWorkspace, WorkspaceCatalog
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,11 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = AppConfig.from_env()
     config.ensure_dirs()
-    db = SQLiteDB(config.sqlite_path)
-    db.initialize()
+    catalog = WorkspaceCatalog(config.app_data_dir)
+    catalog.initialize()
 
     try:
-        return int(args.func(args, config, db))
+        return int(args.func(args, config, catalog))
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -110,43 +111,49 @@ def build_parser() -> argparse.ArgumentParser:
 
 def add_investigation_selector(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--id", type=int, dest="investigation_id")
+    group.add_argument("--id", dest="investigation_id")
     group.add_argument("--name", dest="investigation_name")
 
 
-def cmd_init(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
-    print(f"Initialized SQLite: {config.sqlite_path}")
-    print(f"LanceDB directory: {config.lancedb_dir}")
+def cmd_init(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    print(f"Initialized workspace catalog: {catalog.path}")
+    print(f"Investigation workspaces: {catalog.workspaces_dir}")
     return 0
 
 
-def cmd_create(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
+def cmd_create(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
     roots = [Path(root).expanduser().resolve() for root in args.root]
-    investigation_id = db.create_investigation(args.name, roots, args.notes)
-    print(f"Created investigation {investigation_id}: {args.name}")
+    workspace = catalog.create(args.name, roots, args.notes)
+    print(f"Created investigation {workspace.entry.id}: {args.name}")
+    print(f"Workspace: {workspace.entry.workspace_path}")
     return 0
 
 
-def cmd_list(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
-    for investigation in db.list_investigations():
-        roots = ", ".join(str(root) for root in db.get_roots(investigation.id))
-        print(f"{investigation.id}\t{investigation.name}\t{roots}")
+def cmd_list(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    for entry in catalog.list():
+        workspace = catalog.open(entry)
+        roots = ", ".join(str(root) for root in workspace.db.get_roots(workspace.investigation_id))
+        print(f"{entry.id}\t{entry.name}\t{roots}")
     return 0
 
 
-def cmd_scan(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
-    investigation_id = resolve_investigation_id(db, args)
-    store = LanceDBStore(config.lancedb_dir)
-    pipeline = ScanPipeline(config, db, store, log=print)
-    pipeline.scan_investigation(investigation_id)
+def cmd_scan(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    workspace = resolve_workspace(catalog, args)
+    pipeline = ScanPipeline(
+        config.for_workspace(workspace.entry.workspace_path), workspace.db, workspace.store, log=print
+    )
+    pipeline.scan_investigation(workspace.investigation_id)
     return 0
 
 
-def cmd_search(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
-    investigation_id = resolve_investigation_id(db, args)
-    searcher = build_searcher(config, db, args.mode)
+def cmd_search(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    workspace = resolve_workspace(catalog, args)
+    workspace_config = config.for_workspace(workspace.entry.workspace_path)
+    searcher = build_searcher(workspace_config, workspace.db, args.mode)
     limit = args.limit if args.limit is not None else (None if args.mode == "keyword" else 10)
-    results = searcher.search(investigation_id, args.query, limit=limit, source_types=args.source_types)
+    results = searcher.search(
+        workspace.investigation_id, args.query, limit=limit, source_types=args.source_types
+    )
     if not results:
         print("No results.")
         return 0
@@ -157,8 +164,10 @@ def cmd_search(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int
     return 0
 
 
-def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
-    investigation_id = resolve_investigation_id(db, args)
+def cmd_ask(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    workspace = resolve_workspace(catalog, args)
+    investigation_id = workspace.investigation_id
+    config = config.for_workspace(workspace.entry.workspace_path)
     llm = OllamaLLM(
         OllamaClient(
             config.ollama_base_url,
@@ -168,7 +177,7 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
         ),
         config.ollama_llm_model,
     )
-    searcher = build_rag_searcher(config, db, args.retrieval_profile, llm)
+    searcher = build_rag_searcher(config, workspace.db, args.retrieval_profile, llm)
     answerer = StrictAnswerer(searcher, llm)
     if args.retrieval_profile == "hyde":
         response = answerer.answer_with_evidence_ledger(
@@ -207,14 +216,14 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, db: SQLiteDB) -> int:
     return 0
 
 
-def resolve_investigation_id(db: SQLiteDB, args: argparse.Namespace) -> int:
+def resolve_workspace(catalog: WorkspaceCatalog, args: argparse.Namespace) -> InvestigationWorkspace:
     if getattr(args, "investigation_id", None):
-        row = db.get_investigation(args.investigation_id)
+        entry = catalog.get(args.investigation_id)
     else:
-        row = db.get_investigation_by_name(args.investigation_name)
-    if row is None:
+        entry = catalog.get_by_name(args.investigation_name)
+    if entry is None:
         raise ValueError("Investigation not found.")
-    return int(row["id"])
+    return catalog.open(entry)
 
 
 def build_searcher(config: AppConfig, db: SQLiteDB, mode: str) -> object:

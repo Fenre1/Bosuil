@@ -6,11 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from investigation_rag.extractors.base import BaseExtractor, ExtractedDocument, ExtractedSection
+from investigation_rag.extractors.base import BaseExtractor, EXTRACTOR_VERSION, ExtractedDocument, ExtractedSection
+
+
+PDF_LAYOUT_EXTRACTION_VERSION = "pdf-layout-blocks-v3"
 
 
 class PdfExtractor(BaseExtractor):
     source_type = "pdf"
+    version = f"{EXTRACTOR_VERSION}|{PDF_LAYOUT_EXTRACTION_VERSION}"
 
     def extract(self, path: Path) -> ExtractedDocument:
         try:
@@ -19,25 +23,42 @@ class PdfExtractor(BaseExtractor):
             raise RuntimeError("PyMuPDF is required to extract .pdf files") from exc
 
         sections: list[ExtractedSection] = []
+        document_metadata: dict[str, object] = {}
+        page_count = 0
         with fitz.open(str(path)) as document:
             document_metadata = _clean_metadata(document.metadata or {})
+            page_count = len(document)
             for index, page in enumerate(document, start=1):
                 text = page.get_text("text").strip()
-                if text:
-                    layout = page.get_text("dict")
+                layout = page.get_text("dict")
+                words = page.get_text("words")
+                layout_blocks = extract_pdf_layout_blocks(layout, index, words=words)
+                if text or layout_blocks:
                     sections.append(
                         ExtractedSection(
                             text=text,
                             source_type=self.source_type,
                             page_number=index,
-                            display_markdown=pdf_layout_to_markdown(layout),
-                            metadata={**document_metadata, "page_number": index},
+                            display_markdown=pdf_layout_to_markdown(layout, words=words),
+                            metadata={
+                                **document_metadata,
+                                "page_number": index,
+                                "raw_text": text,
+                                "layout_blocks": layout_blocks,
+                                "page_width": _safe_float(layout.get("width"), 0.0),
+                                "page_height": _safe_float(layout.get("height"), 0.0),
+                            },
                         )
                     )
         return ExtractedDocument(
             source_type=self.source_type,
             sections=sections,
-            metadata={"path": str(path), "page_count": len(sections), **document_metadata},
+            metadata={
+                "path": str(path),
+                "page_count": page_count,
+                "pdf_layout_version": PDF_LAYOUT_EXTRACTION_VERSION,
+                **document_metadata,
+            },
         )
 
 
@@ -66,8 +87,232 @@ class PdfLine:
     y1: float
 
 
-def pdf_layout_to_markdown(layout: dict[str, Any]) -> str | None:
-    raw_lines = _extract_lines(layout)
+def extract_pdf_layout_blocks(
+    layout: dict[str, Any],
+    page_number: int,
+    words: list[tuple[Any, ...]] | None = None,
+) -> list[dict[str, Any]]:
+    page_width = _safe_float(layout.get("width"), 0.0)
+    page_height = _safe_float(layout.get("height"), 0.0)
+    words_by_line = _words_by_line(words or [])
+    blocks: list[dict[str, Any]] = []
+    reading_order = 0
+    for block_index, block in enumerate(layout.get("blocks", [])):
+        if block.get("type", 0) != 0:
+            continue
+        for line_index, line in enumerate(block.get("lines", [])):
+            spans = [span for span in line.get("spans", []) if str(span.get("text", "")).strip()]
+            if not spans:
+                continue
+            span_text = _join_span_text(spans).strip()
+            word_text = _line_text_from_words(words_by_line, block_index, line_index)
+            text = _best_line_text(span_text, word_text)
+            if not text:
+                continue
+            bbox = _bbox_tuple(line.get("bbox") or block.get("bbox") or (0, 0, 0, 0))
+            sizes = [_safe_float(span.get("size"), 0.0) for span in spans]
+            flags = [int(span.get("flags", 0)) for span in spans]
+            font_names = [str(span.get("font", "")).lower() for span in spans]
+            span_payloads = [
+                _span_payload(span, page_width, page_height)
+                for span in spans
+            ]
+            blocks.append(
+                {
+                    "block_id": f"p{page_number}-b{block_index}-l{line_index}",
+                    "text": text,
+                    "page_number": page_number,
+                    "bbox": list(bbox),
+                    "rel_bbox": _relative_bbox(bbox, page_width, page_height),
+                    "page_width": page_width,
+                    "page_height": page_height,
+                    "font_size": max(sizes) if sizes else 0.0,
+                    "flags": _combined_flags(flags),
+                    "bold": any(_span_is_bold(flag, font_name) for flag, font_name in zip(flags, font_names)),
+                    "italic": any(_span_is_italic(flag, font_name) for flag, font_name in zip(flags, font_names)),
+                    "reading_order": reading_order,
+                    "metadata": {
+                        "block_index": block_index,
+                        "line_index": line_index,
+                        "span_count": len(spans),
+                    },
+                    "spans": span_payloads,
+                }
+            )
+            reading_order += 1
+    return blocks
+
+
+def _span_payload(span: dict[str, Any], page_width: float, page_height: float) -> dict[str, Any]:
+    bbox = _bbox_tuple(span.get("bbox") or (0, 0, 0, 0))
+    flags = int(span.get("flags", 0))
+    font_name = str(span.get("font", ""))
+    return {
+        "text": str(span.get("text", "")),
+        "bbox": list(bbox),
+        "rel_bbox": _relative_bbox(bbox, page_width, page_height),
+        "font": font_name,
+        "font_size": _safe_float(span.get("size"), 0.0),
+        "flags": flags,
+        "bold": _span_is_bold(flags, font_name.lower()),
+        "italic": _span_is_italic(flags, font_name.lower()),
+    }
+
+
+def _words_by_line(words: list[tuple[Any, ...]]) -> dict[tuple[int, int], list[tuple[float, float, float, float, str, int]]]:
+    grouped: dict[tuple[int, int], list[tuple[float, float, float, float, str, int]]] = {}
+    for word in words:
+        if len(word) < 8:
+            continue
+        text = str(word[4]).strip()
+        if not text:
+            continue
+        block_index = _safe_int(word[5], -1)
+        line_index = _safe_int(word[6], -1)
+        word_index = _safe_int(word[7], len(grouped.get((block_index, line_index), [])))
+        if block_index < 0 or line_index < 0:
+            continue
+        grouped.setdefault((block_index, line_index), []).append(
+            (
+                _safe_float(word[0], 0.0),
+                _safe_float(word[1], 0.0),
+                _safe_float(word[2], 0.0),
+                _safe_float(word[3], 0.0),
+                text,
+                word_index,
+            )
+        )
+    for line_words in grouped.values():
+        line_words.sort(key=lambda item: (item[5], item[0], item[1]))
+    return grouped
+
+
+def _line_text_from_words(
+    words_by_line: dict[tuple[int, int], list[tuple[float, float, float, float, str, int]]],
+    block_index: int,
+    line_index: int,
+) -> str:
+    line_words = words_by_line.get((block_index, line_index), [])
+    if not line_words:
+        return ""
+    return _join_word_tokens(line_words)
+
+
+def _join_word_tokens(words: list[tuple[float, float, float, float, str, int]]) -> str:
+    output = ""
+    previous: tuple[float, float, float, float, str, int] | None = None
+    for word in words:
+        token = word[4]
+        if not token:
+            continue
+        if output and previous is not None and _needs_word_token_space(previous[4], token):
+            output += " "
+        output += token
+        previous = word
+    return output.strip()
+
+
+def _needs_word_token_space(previous_text: str, current_text: str) -> bool:
+    if previous_text.endswith("-") and current_text[:1].islower():
+        return False
+    if current_text[:1] in {".", ",", ";", ":", "!", "?", ")", "]", "}", "%", "∗", "*", "†", "‡"}:
+        return False
+    if previous_text[-1:] in {"(", "[", "{", "/", "\\"}:
+        return False
+    return True
+
+
+def _best_line_text(span_text: str, word_text: str) -> str:
+    span_text = span_text.strip()
+    word_text = word_text.strip()
+    if not word_text:
+        return span_text
+    if not span_text:
+        return word_text
+    if _looks_space_collapsed(span_text, word_text):
+        return word_text
+    if word_text.count(" ") > span_text.count(" ") and len(word_text) >= len(span_text) * 0.75:
+        return word_text
+    return span_text
+
+
+def _looks_space_collapsed(span_text: str, word_text: str) -> bool:
+    if word_text.count(" ") == 0:
+        return False
+    if span_text.count(" ") >= word_text.count(" ") * 0.5:
+        return False
+    collapsed_word_text = re.sub(r"\s+", "", word_text)
+    collapsed_span_text = re.sub(r"\s+", "", span_text)
+    return collapsed_word_text == collapsed_span_text or collapsed_span_text in collapsed_word_text
+
+
+def _join_span_text(spans: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    previous_span: dict[str, Any] | None = None
+    for span in spans:
+        text = str(span.get("text", ""))
+        if not text:
+            continue
+        if parts and previous_span is not None and _needs_span_space(previous_span, span, parts[-1], text):
+            parts.append(" ")
+        parts.append(text)
+        previous_span = span
+    return "".join(parts)
+
+
+def _needs_span_space(previous_span: dict[str, Any], current_span: dict[str, Any], previous_text: str, current_text: str) -> bool:
+    if previous_text.endswith((" ", "\t", "\n")) or current_text.startswith((" ", "\t", "\n")):
+        return False
+    if previous_text.endswith("-") and current_text[:1].islower():
+        return False
+    if current_text[:1] in {".", ",", ";", ":", "!", "?", ")", "]", "}", "%", "∗", "*", "†", "‡"}:
+        return False
+    if previous_text[-1:] in {"(", "[", "{", "/", "\\"}:
+        return False
+    previous_bbox = _bbox_tuple(previous_span.get("bbox") or (0, 0, 0, 0))
+    current_bbox = _bbox_tuple(current_span.get("bbox") or (0, 0, 0, 0))
+    gap = current_bbox[0] - previous_bbox[2]
+    if gap <= 0:
+        return False
+    previous_size = _safe_float(previous_span.get("size"), 0.0)
+    current_size = _safe_float(current_span.get("size"), 0.0)
+    font_size = min(value for value in (previous_size, current_size) if value > 0) if previous_size > 0 or current_size > 0 else 10.0
+    return gap >= max(1.0, font_size * 0.18)
+
+
+def _bbox_tuple(value: object) -> tuple[float, float, float, float]:
+    if isinstance(value, (list, tuple)):
+        coords = [_safe_float(item, 0.0) for item in value[:4]]
+    else:
+        coords = []
+    coords.extend([0.0] * (4 - len(coords)))
+    return (coords[0], coords[1], coords[2], coords[3])
+
+
+def _relative_bbox(
+    bbox: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+) -> list[float]:
+    width = page_width or 1.0
+    height = page_height or 1.0
+    return [
+        bbox[0] / width,
+        bbox[1] / height,
+        bbox[2] / width,
+        bbox[3] / height,
+    ]
+
+
+def _combined_flags(flags: list[int]) -> int:
+    combined = 0
+    for flag in flags:
+        combined |= flag
+    return combined
+
+
+def pdf_layout_to_markdown(layout: dict[str, Any], words: list[tuple[Any, ...]] | None = None) -> str | None:
+    raw_lines = _extract_lines(layout, words=words)
     if not raw_lines:
         return None
     page_width = _safe_float(layout.get("width"), 0.0) or max((line.x1 for line in raw_lines), default=0.0)
@@ -97,16 +342,19 @@ def pdf_layout_to_markdown(layout: dict[str, Any]) -> str | None:
     return markdown or None
 
 
-def _extract_lines(layout: dict[str, Any]) -> list[PdfLine]:
+def _extract_lines(layout: dict[str, Any], words: list[tuple[Any, ...]] | None = None) -> list[PdfLine]:
+    words_by_line = _words_by_line(words or [])
     raw_lines: list[PdfLine] = []
-    for block in layout.get("blocks", []):
+    for block_index, block in enumerate(layout.get("blocks", [])):
         if block.get("type", 0) != 0:
             continue
-        for line in block.get("lines", []):
+        for line_index, line in enumerate(block.get("lines", [])):
             spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
             if not spans:
                 continue
-            text = "".join(str(span.get("text", "")) for span in spans).strip()
+            span_text = _join_span_text(spans).strip()
+            word_text = _line_text_from_words(words_by_line, block_index, line_index)
+            text = _best_line_text(span_text, word_text)
             sizes = [_safe_float(span.get("size"), 0.0) for span in spans]
             flags = [int(span.get("flags", 0)) for span in spans]
             font_names = [str(span.get("font", "")).lower() for span in spans]
@@ -423,9 +671,20 @@ def _span_is_bold(flags: int, font_name: str) -> bool:
     return bool(flags & 16) or "bold" in font_name or "black" in font_name or "semibold" in font_name
 
 
+def _span_is_italic(flags: int, font_name: str) -> bool:
+    return bool(flags & 2) or "italic" in font_name or "oblique" in font_name
+
+
 def _safe_float(value: object, fallback: float) -> float:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_int(value: object, fallback: int) -> int:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return fallback
 

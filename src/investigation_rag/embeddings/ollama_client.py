@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urlparse
@@ -16,6 +16,8 @@ class OllamaClient:
     timeout: int = 120
     allow_remote: bool = False
     num_ctx: int = 0
+    request_count: int = field(init=False, default=0)
+    _session: Any = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.base_url = validate_ollama_base_url(self.base_url, allow_remote=self.allow_remote)
@@ -126,9 +128,19 @@ class OllamaClient:
         except ImportError as exc:
             raise OllamaError("requests is required for Ollama integration.") from exc
 
-        with requests.Session() as session:
-            session.trust_env = False
-            return session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
+        self.request_count += 1
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.trust_env = False
+        return self._session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
+
+    def close(self) -> None:
+        if self._session is None:
+            return
+        close = getattr(self._session, "close", None)
+        if callable(close):
+            close()
+        self._session = None
 
 
 def validate_ollama_base_url(base_url: str, allow_remote: bool = False) -> str:

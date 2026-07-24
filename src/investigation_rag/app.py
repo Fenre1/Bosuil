@@ -3,11 +3,12 @@ from __future__ import annotations
 import sys
 
 from investigation_rag.config import AppConfig
-from investigation_rag.db.lancedb_store import LanceDBStore
-from investigation_rag.db.sqlite_db import SQLiteDB
+from investigation_rag.utils.logging import configure_logging
+from investigation_rag.workspace import WorkspaceCatalog
 
 
 def main() -> int:
+    configure_logging()
     try:
         from PyQt5.QtWidgets import QApplication
     except ImportError as exc:
@@ -18,16 +19,15 @@ def main() -> int:
 
     config = AppConfig.from_env()
     config.ensure_dirs()
-    db = SQLiteDB(config.sqlite_path)
-    db.initialize()
-    store = LanceDBStore(config.lancedb_dir)
+    catalog = WorkspaceCatalog(config.app_data_dir)
+    catalog.initialize()
 
     app = QApplication(sys.argv)
     apply_app_style(app)
     icon = app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
-    window = MainWindow(config, db, store)
+    window = MainWindow(config, catalog)
     window.resize(1200, 780)
     window.show()
     return app.exec_()

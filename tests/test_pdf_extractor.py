@@ -1,4 +1,4 @@
-from investigation_rag.extractors.pdf_extractor import pdf_layout_to_markdown
+from investigation_rag.extractors.pdf_extractor import extract_pdf_layout_blocks, pdf_layout_to_markdown
 
 
 def test_pdf_layout_to_markdown_infers_headings_and_bullets():
@@ -27,6 +27,105 @@ def test_pdf_layout_to_markdown_infers_headings_and_bullets():
     markdown = pdf_layout_to_markdown(layout)
 
     assert markdown == "# Investigation Summary\n\nThis paragraph remains normal text.\n\n- First finding"
+
+
+def test_extract_pdf_layout_blocks_preserves_relative_coordinates_and_spans():
+    layout = {
+        "width": 600,
+        "height": 800,
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [
+                    {
+                        "bbox": [60, 80, 300, 96],
+                        "spans": [{"text": "Investigation Summary", "size": 18, "flags": 18, "font": "Arial-BoldItalic"}],
+                    }
+                ],
+            }
+        ],
+    }
+
+    blocks = extract_pdf_layout_blocks(layout, page_number=2)
+
+    assert blocks[0]["text"] == "Investigation Summary"
+    assert blocks[0]["page_number"] == 2
+    assert blocks[0]["rel_bbox"] == [0.1, 0.1, 0.5, 0.12]
+    assert blocks[0]["bold"] is True
+    assert blocks[0]["italic"] is True
+    assert blocks[0]["spans"][0]["font_size"] == 18
+
+
+def test_extract_pdf_layout_blocks_restores_spaces_between_visually_separated_spans():
+    layout = {
+        "width": 600,
+        "height": 800,
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [
+                    {
+                        "bbox": [60, 80, 300, 96],
+                        "spans": [
+                            {"text": "Rapid", "bbox": [60, 80, 88, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "progress", "bbox": [92, 80, 135, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "in", "bbox": [139, 80, 148, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "AI", "bbox": [152, 80, 164, 96], "size": 10, "flags": 0, "font": "Times"},
+                        ],
+                    },
+                    {
+                        "bbox": [60, 110, 150, 126],
+                        "spans": [
+                            {"text": "Dario Amodei", "bbox": [60, 110, 124, 126], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "∗", "bbox": [125, 108, 130, 118], "size": 7, "flags": 0, "font": "Times"},
+                        ],
+                    },
+                ],
+            }
+        ],
+    }
+
+    blocks = extract_pdf_layout_blocks(layout, page_number=1)
+    markdown = pdf_layout_to_markdown(layout)
+
+    assert blocks[0]["text"] == "Rapid progress in AI"
+    assert blocks[1]["text"] == "Dario Amodei∗"
+    assert "Rapid progress in AI" in markdown
+
+
+def test_extract_pdf_layout_blocks_prefers_word_boundaries_when_spans_are_collapsed():
+    layout = {
+        "width": 600,
+        "height": 800,
+        "blocks": [
+            {
+                "type": 0,
+                "lines": [
+                    {
+                        "bbox": [60, 80, 260, 96],
+                        "spans": [
+                            {"text": "For", "bbox": [60, 80, 76, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "concreteness,", "bbox": [76, 80, 130, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "we", "bbox": [130, 80, 140, 96], "size": 10, "flags": 0, "font": "Times"},
+                            {"text": "will", "bbox": [140, 80, 154, 96], "size": 10, "flags": 0, "font": "Times"},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    words = [
+        (60, 80, 76, 96, "For", 0, 0, 0),
+        (80, 80, 130, 96, "concreteness,", 0, 0, 1),
+        (134, 80, 144, 96, "we", 0, 0, 2),
+        (148, 80, 162, 96, "will", 0, 0, 3),
+    ]
+
+    blocks = extract_pdf_layout_blocks(layout, page_number=1, words=words)
+    markdown = pdf_layout_to_markdown(layout, words=words)
+
+    assert blocks[0]["text"] == "For concreteness, we will"
+    assert markdown == "For concreteness, we will"
 
 
 def test_pdf_layout_to_markdown_leaves_long_sentences_as_text():

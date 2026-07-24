@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS files (
   extractor_version TEXT,
   extraction_status TEXT NOT NULL DEFAULT 'pending',
   extraction_error TEXT,
+  active_chunk_count INTEGER NOT NULL DEFAULT 0,
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from investigation_rag.utils.env import load_dotenv_if_available
@@ -59,6 +59,8 @@ class AppConfig:
     rag_deep_rerank_candidates: int
     rag_deep_final_answer_chunks: int
     gui_lazy_load_file_chunk_text: bool
+    pdf_chunk_soft_min_chars: int = 1200
+    pdf_chunk_overlap_mode: str = "sentence"
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -70,8 +72,8 @@ class AppConfig:
 
         return cls(
             app_data_dir=app_data_dir,
-            sqlite_path=app_data_dir / "investigations.sqlite3",
-            lancedb_dir=app_data_dir / "lancedb",
+            sqlite_path=app_data_dir / "catalog.sqlite3",
+            lancedb_dir=app_data_dir / "investigations",
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_allow_remote=_bool_env("INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA", False),
             ollama_timeout_seconds=_positive_int_env("OLLAMA_TIMEOUT_SECONDS", 120),
@@ -96,8 +98,17 @@ class AppConfig:
             rag_deep_rerank_candidates=_int_env("RAG_DEEP_RERANK_CANDIDATES", 200),
             rag_deep_final_answer_chunks=_int_env("RAG_DEEP_FINAL_ANSWER_CHUNKS", 12),
             gui_lazy_load_file_chunk_text=_bool_env("GUI_LAZY_LOAD_FILE_CHUNK_TEXT", True),
+            pdf_chunk_soft_min_chars=_int_env("RAG_PDF_CHUNK_SOFT_MIN_CHARS", 1200),
+            pdf_chunk_overlap_mode=os.getenv("RAG_PDF_CHUNK_OVERLAP_MODE", "sentence").strip().lower() or "sentence",
         )
 
     def ensure_dirs(self) -> None:
         self.app_data_dir.mkdir(parents=True, exist_ok=True)
-        self.lancedb_dir.mkdir(parents=True, exist_ok=True)
+        (self.app_data_dir / "investigations").mkdir(parents=True, exist_ok=True)
+
+    def for_workspace(self, workspace_path: Path) -> "AppConfig":
+        return replace(
+            self,
+            sqlite_path=workspace_path / "investigation.sqlite3",
+            lancedb_dir=workspace_path / "lancedb",
+        )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Event
+
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget
 
@@ -20,14 +22,24 @@ class ScanWorker(QObject):
         self.db = db
         self.store = store
         self.investigation_id = investigation_id
+        self._stop_event = Event()
 
     def run(self) -> None:
         try:
-            pipeline = ScanPipeline(self.config, self.db, self.store, log=self.log.emit)
+            pipeline = ScanPipeline(
+                self.config,
+                self.db,
+                self.store,
+                log=self.log.emit,
+                stop_requested=self._stop_event.is_set,
+            )
             pipeline.scan_investigation(self.investigation_id)
             self.finished.emit("")
         except Exception as exc:
             self.finished.emit(f"Scan failed: {exc}")
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
 
 
 class ScanPanel(QWidget):
@@ -44,6 +56,10 @@ class ScanPanel(QWidget):
         self.scan_button = QPushButton("Scan investigation")
         self.scan_button.setObjectName("PrimaryButton")
         self.scan_button.setEnabled(False)
+        self.stop_button = QPushButton("Stop scan")
+        self.stop_button.setObjectName("GhostButton")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_scan)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("Scan activity will appear here")
@@ -107,6 +123,7 @@ class ScanPanel(QWidget):
             return
         self.log_view.append("Starting scan.")
         self.scan_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
         thread = QThread(self)
         worker = ScanWorker(self.config, self.db, self.store, self.investigation_id)
         self.thread = thread
@@ -121,6 +138,13 @@ class ScanPanel(QWidget):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
+    def stop_scan(self) -> None:
+        if self.worker is None or self.thread is None:
+            return
+        self.worker.request_stop()
+        self.stop_button.setEnabled(False)
+        self.log_view.append("Stop requested. Finishing the current file…")
+
     def scan_finished(self, message: str) -> None:
         if message:
             self.log_view.append(message)
@@ -129,6 +153,7 @@ class ScanPanel(QWidget):
         self.thread = None
         self.worker = None
         self.scan_button.setEnabled(self.investigation_id is not None)
+        self.stop_button.setEnabled(False)
         self.disappeared_panel.refresh()
 
     def shutdown(self, wait_ms: int = 5000) -> None:

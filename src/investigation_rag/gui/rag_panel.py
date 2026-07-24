@@ -37,7 +37,7 @@ from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
 from investigation_rag.retrieval.hyde import HYDE_FINAL_CHUNK_LIMIT, HYDE_LEDGER_BATCH_SIZE
-from investigation_rag.retrieval.ranking import SearchResult
+from investigation_rag.retrieval.ranking import SearchResult, result_location_label
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
     ANSWER_STYLE_LENIENT,
@@ -1107,9 +1107,7 @@ class RagPanel(QWidget):
 
     @staticmethod
     def location_label(result: SearchResult) -> str:
-        if result.page_number:
-            return f"page {result.page_number}"
-        return f"chunk {result.chunk_index + 1}"
+        return result_location_label(result)
 
 
 def answer_model_label(model: dict[str, object]) -> str:

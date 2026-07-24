@@ -20,3 +20,10 @@ def get_extractor_for_path(path: str | Path) -> BaseExtractor:
     if suffix == ".msg":
         return MsgExtractor()
     raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def get_extractor_version_for_suffix(suffix: str) -> str:
+    normalized = suffix.lower()
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    return get_extractor_for_path(f"file{normalized}").version

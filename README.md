@@ -1,6 +1,6 @@
 # Local Investigation RAG
 
-Windows-first, developer-run desktop app for indexing investigation folders and asking strict local RAG questions over `.txt`, `.docx`, `.pdf`, and `.msg` files. The UI uses PyQt5. Storage is one global SQLite database plus one global LanceDB database, with every file and chunk scoped by `investigation_id`.
+Windows-first, developer-run desktop app for indexing investigation folders and asking strict local RAG questions over `.txt`, `.docx`, `.pdf`, and `.msg` files. The UI uses PyQt5. Each investigation is an isolated workspace with its own SQLite and LanceDB stores.
 
 No cloud APIs are used. Ollama is called on the local machine for embeddings and generation.
 
@@ -37,6 +37,8 @@ OLLAMA_EMBED_QUERY_INSTRUCTION=Given a user question, retrieve relevant passages
 
 By default data is stored under `%LOCALAPPDATA%\InvestigationRAG`. Real environment variables still take priority over values in `.env`, so temporary PowerShell overrides continue to work. If you keep the file somewhere else, set `INVESTIGATION_RAG_ENV_FILE` to that path before running the app.
 
+`INVESTIGATION_RAG_DATA_DIR` contains a small `catalog.sqlite3` plus UUID-named workspaces under `investigations\`. Each workspace contains `investigation.sqlite3`, `lancedb\`, and `manifest.json`. Copying a complete workspace directory into `investigations\` makes it discoverable on the next application start; source evidence is not copied.
+
 The app rejects non-loopback Ollama URLs by default and the Ollama client ignores proxy environment variables. Keep `INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0` for sensitive data. Only set it to `1` for a trusted non-sensitive setup where the Ollama server is intentionally hosted away from the same machine.
 
 For slower local models or long evidence-ledger RAG runs, raise `OLLAMA_TIMEOUT_SECONDS` in `.env`; for example, `600` waits up to ten minutes for each local Ollama request.
@@ -56,6 +58,14 @@ investigation-rag-gui
 ```
 
 The GUI includes an investigation selector, create/edit dialog, root folder management, manual scan, scan log, keyword/semantic/hybrid search, result preview, Windows file/folder opening, contextual conversational strict RAG questions with PDF export, and disappeared-file review.
+
+## Performance diagnostics
+
+Workspace-open timings are written to the console and appended to the scan log. A completed,
+stopped, or failed scan also writes a timing breakdown, embedding-cache hit/miss counts, and
+the ten slowest files to the scan log. To diagnose a slow collection, open the investigation,
+run one scan, and copy the lines beginning with `Workspace load timing`, `Timing breakdown`,
+`Embedding cache`, and `Slowest files`.
 
 ## CLI
 

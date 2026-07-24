@@ -57,16 +57,31 @@ class SQLiteDB:
             conn.executescript(schema_path.read_text(encoding="utf-8"))
             self._ensure_column(conn, "chunks", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chunks", "display_markdown", "TEXT")
+            chunk_count_added = self._ensure_column(
+                conn, "files", "active_chunk_count", "INTEGER NOT NULL DEFAULT 0"
+            )
+            if chunk_count_added:
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET active_chunk_count = (
+                        SELECT COUNT(*) FROM chunks
+                        WHERE chunks.file_id = files.id AND chunks.is_active = 1
+                    )
+                    """
+                )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
                 (1, utc_now()),
             )
 
     @staticmethod
-    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> bool:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            return True
+        return False
 
     def create_investigation(self, name: str, roots: list[Path], notes: str = "") -> int:
         now = utc_now()
@@ -286,13 +301,16 @@ class SQLiteDB:
                 "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ? AND is_active = 0)",
                 (file_id,),
             )
+            conn.execute("UPDATE files SET active_chunk_count = 0 WHERE id = ?", (file_id,))
 
     def insert_chunks(self, chunks: list[dict[str, Any]]) -> None:
         if not chunks:
             return
         now = utc_now()
         with self.transaction() as conn:
+            file_ids: set[int] = set()
             for chunk in chunks:
+                file_ids.add(int(chunk["file_id"]))
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO chunks(
@@ -341,6 +359,18 @@ class SQLiteDB:
                         chunk.get("searchable_text", chunk["chunk_text"]),
                         chunk["path"],
                     ),
+                )
+            for file_id in file_ids:
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET active_chunk_count = (
+                        SELECT COUNT(*) FROM chunks
+                        WHERE chunks.file_id = files.id AND chunks.is_active = 1
+                    )
+                    WHERE id = ?
+                    """,
+                    (file_id,),
                 )
 
     def update_chunk_metadata(self, chunks: list[dict[str, Any]]) -> None:
@@ -407,6 +437,19 @@ class SQLiteDB:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM chunks WHERE file_id = ? AND is_active = 1 ORDER BY chunk_index",
+                (file_id,),
+            ).fetchall()
+
+    def active_chunk_summaries_for_file(self, file_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT id, file_id, chunk_index, source_type, page_number,
+                       email_subject, attachment_name, path
+                FROM chunks
+                WHERE file_id = ? AND is_active = 1
+                ORDER BY chunk_index
+                """,
                 (file_id,),
             ).fetchall()
 
@@ -634,6 +677,32 @@ class SQLiteDB:
             ).fetchone()
         return json.loads(row["vector_json"]) if row else None
 
+    def get_embeddings(self, chunk_text_hashes: list[str], embedding_model: str) -> dict[str, list[float]]:
+        if not chunk_text_hashes:
+            return {}
+        result: dict[str, list[float]] = {}
+        unique_hashes = list(dict.fromkeys(chunk_text_hashes))
+        with self.connection() as conn:
+            for start in range(0, len(unique_hashes), 900):
+                batch = unique_hashes[start : start + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT chunk_text_hash, vector_json
+                    FROM embedding_cache
+                    WHERE embedding_model = ?
+                      AND chunk_text_hash IN ({placeholders})
+                    """,
+                    [embedding_model, *batch],
+                ).fetchall()
+                result.update(
+                    {
+                        str(row["chunk_text_hash"]): json.loads(row["vector_json"])
+                        for row in rows
+                    }
+                )
+        return result
+
     def set_embedding(self, chunk_text_hash: str, embedding_model: str, vector: list[float]) -> None:
         with self.transaction() as conn:
             conn.execute(
@@ -642,6 +711,24 @@ class SQLiteDB:
                 VALUES(?, ?, ?, ?)
                 """,
                 (chunk_text_hash, embedding_model, json.dumps(vector), utc_now()),
+            )
+
+    def set_embeddings(self, embeddings: list[tuple[str, list[float]]], embedding_model: str) -> None:
+        if not embeddings:
+            return
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO embedding_cache(
+                    chunk_text_hash, embedding_model, vector_json, created_at
+                )
+                VALUES(?, ?, ?, ?)
+                """,
+                [
+                    (text_hash, embedding_model, json.dumps(vector), now)
+                    for text_hash, vector in embeddings
+                ],
             )
 
     def keyword_search(
@@ -754,6 +841,19 @@ class SQLiteDB:
                 (investigation_id,),
             ).fetchall()
 
+    def file_browser_files_for_investigation(self, investigation_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT id, path, normalized_path, source_type, extraction_status,
+                       active_chunk_count
+                FROM files
+                WHERE investigation_id = ? AND status = 'active'
+                ORDER BY normalized_path
+                """,
+                (investigation_id,),
+            ).fetchall()
+
     def add_disappeared_file(self, investigation_id: int, file_id: int, path: str, last_seen_at: str) -> None:
         with self.transaction() as conn:
             chunk_count_row = conn.execute(
@@ -814,6 +914,7 @@ class SQLiteDB:
                     "UPDATE chunks SET is_active = 0, updated_at = ? WHERE file_id = ?",
                     (now, file_id),
                 )
+                conn.execute("UPDATE files SET active_chunk_count = 0 WHERE id = ?", (file_id,))
                 conn.execute("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = ?)", (file_id,))
                 status = "inactive"
             elif action == "keep":

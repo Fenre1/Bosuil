@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from time import perf_counter
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QPixmap
@@ -29,6 +31,9 @@ from investigation_rag.gui.investigation_dialog import InvestigationDialog
 from investigation_rag.gui.rag_panel import RagPanel
 from investigation_rag.gui.scan_panel import ScanPanel
 from investigation_rag.gui.search_panel import SearchPanel
+from investigation_rag.workspace import InvestigationWorkspace, WorkspaceCatalog
+
+LOGGER = logging.getLogger(__name__)
 
 
 def app_icon_path() -> Path | None:
@@ -73,15 +78,19 @@ def crop_transparent_padding(pixmap: QPixmap) -> QPixmap:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, config: AppConfig, db: SQLiteDB, store: LanceDBStore):
+    def __init__(self, config: AppConfig, catalog: WorkspaceCatalog):
         super().__init__()
         self.config = config
-        self.db = db
-        self.store = store
+        self.catalog = catalog
+        self.workspace: InvestigationWorkspace | None = None
+        self.db = SQLiteDB(catalog.path)
+        self.store = LanceDBStore(config.app_data_dir / ".inactive-lancedb")
         self.folder_scope = FolderScope()
         self.file_type_scope = FileTypeScope()
-        self._active_investigation_id: int | None = None
-        self._loading_investigation_id: int | None = None
+        self._active_workspace_id: str | None = None
+        self._loading_workspace_id: str | None = None
+        self._workspace_load_started_at: float | None = None
+        self._workspace_load_timing: dict[str, float] = {}
         self.setWindowTitle("Bosuil, de lokale antwoordvogel")
         icon = app_icon()
         if not icon.isNull():
@@ -128,17 +137,17 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabBar().setElideMode(Qt.ElideNone)
         self.tabs.tabBar().setUsesScrollButtons(True)
-        self.scan_panel = ScanPanel(config, db, store)
+        self.scan_panel = ScanPanel(config, self.db, self.store)
         self.scan_panel.scan_button.clicked.connect(self.scan_selected_investigation)
         self.scan_panel.set_investigation_selector(self.build_investigation_selector())
-        self.folder_scope_panel = FolderScopePanel(db, self.folder_scope)
+        self.folder_scope_panel = FolderScopePanel(self.db, self.folder_scope)
         self.file_type_scope_panel = FileTypeScopePanel(self.file_type_scope)
         self.filters_panel = self.build_filters_panel()
-        self.files_panel = FilesPanel(db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
+        self.files_panel = FilesPanel(self.db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
         self.files_panel.load_started.connect(self.on_investigation_data_load_started)
         self.files_panel.load_finished.connect(self.on_investigation_data_load_finished)
-        self.search_panel = SearchPanel(config, db, store, self.folder_scope, self.file_type_scope)
-        self.rag_panel = RagPanel(config, db, store, self.folder_scope, self.file_type_scope)
+        self.search_panel = SearchPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
+        self.rag_panel = RagPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
         self.tabs.addTab(self.scan_panel, "Onderzoeken")
         self.tabs.addTab(self.filters_panel, "Filters")
         self.tabs.addTab(self.files_panel, "Bestanden")
@@ -213,6 +222,7 @@ class MainWindow(QMainWindow):
         scan_row = QHBoxLayout()
         scan_row.setSpacing(8)
         scan_row.addWidget(self.scan_panel.scan_button)
+        scan_row.addWidget(self.scan_panel.stop_button)
 
         selector_layout.addLayout(header_row)
         selector_layout.addWidget(self.investigation_list, 1)
@@ -221,29 +231,30 @@ class MainWindow(QMainWindow):
         selector_layout.addLayout(scan_row)
         return selector
 
-    def active_investigation_id(self) -> int | None:
-        return self._active_investigation_id
+    def active_workspace_id(self) -> str | None:
+        return self._active_workspace_id
 
-    def selected_investigation_id(self) -> int | None:
+    def selected_workspace_id(self) -> str | None:
         item = self.investigation_list.currentItem()
         if item is None:
             return None
         data = item.data(Qt.UserRole)
-        return int(data) if data is not None else None
+        return str(data) if data is not None else None
 
-    def reload_investigations(self, select_id: int | None = None) -> None:
-        current = select_id if select_id is not None else self.selected_investigation_id()
-        loaded_id = self.active_investigation_id()
+    def reload_investigations(self, select_id: str | None = None) -> None:
+        current = select_id if select_id is not None else self.selected_workspace_id()
+        loaded_id = self.active_workspace_id()
         seen_ids = set()
         self.investigation_list.blockSignals(True)
         self.investigation_list.clear()
-        for investigation in self.db.list_investigations():
+        for investigation in self.catalog.list():
             seen_ids.add(investigation.id)
             item = QListWidgetItem(investigation.name)
             item.setData(Qt.UserRole, investigation.id)
             self.investigation_list.addItem(item)
         if loaded_id is not None and loaded_id not in seen_ids:
-            self._active_investigation_id = None
+            self._active_workspace_id = None
+            self.workspace = None
         if current is not None:
             self.select_investigation(current)
         else:
@@ -251,10 +262,10 @@ class MainWindow(QMainWindow):
         self.investigation_list.blockSignals(False)
         self.update_investigation_actions()
         self.refresh_loaded_investigation_marker()
-        if loaded_id != self.active_investigation_id():
+        if loaded_id != self.active_workspace_id():
             self.on_investigation_changed()
 
-    def select_investigation(self, investigation_id: int) -> None:
+    def select_investigation(self, investigation_id: str) -> None:
         for row in range(self.investigation_list.count()):
             item = self.investigation_list.item(row)
             if item is not None and item.data(Qt.UserRole) == investigation_id:
@@ -263,40 +274,86 @@ class MainWindow(QMainWindow):
         self.investigation_list.setCurrentRow(-1)
 
     def load_selected_investigation(self) -> None:
-        investigation_id = self.selected_investigation_id()
-        if investigation_id is None:
+        workspace_id = self.selected_workspace_id()
+        if workspace_id is None:
             return
-        self.set_active_investigation(investigation_id)
+        self.set_active_investigation(workspace_id)
 
-    def set_active_investigation(self, investigation_id: int | None) -> None:
-        self._active_investigation_id = investigation_id
-        self._loading_investigation_id = investigation_id
+    def set_active_investigation(self, workspace_id: str | None) -> None:
+        total_started = perf_counter()
+        self._workspace_load_started_at = total_started
+        self._workspace_load_timing = {}
+        if workspace_id is None:
+            self.workspace = None
+            self._active_workspace_id = None
+        else:
+            phase_started = perf_counter()
+            entry = self.catalog.get(workspace_id)
+            if entry is None:
+                raise ValueError("Investigation workspace not found.")
+            self.workspace = self.catalog.open(entry)
+            self._workspace_load_timing["catalog and workspace open"] = perf_counter() - phase_started
+            phase_started = perf_counter()
+            self._active_workspace_id = workspace_id
+            self._apply_workspace_dependencies(self.workspace)
+            self._workspace_load_timing["dependency setup"] = perf_counter() - phase_started
+        self._loading_workspace_id = workspace_id
         self.refresh_loaded_investigation_marker()
         QApplication.processEvents()
+        phase_started = perf_counter()
         self.on_investigation_changed()
+        self._workspace_load_timing["synchronous panel refresh"] = perf_counter() - phase_started
 
     def on_investigation_changed(self) -> None:
-        investigation_id = self.active_investigation_id()
-        for panel in (
-            self.scan_panel,
-            self.folder_scope_panel,
-            self.file_type_scope_panel,
-            self.files_panel,
-            self.search_panel,
-            self.rag_panel,
+        investigation_id = self.workspace.investigation_id if self.workspace is not None else None
+        for label, panel in (
+            ("scan panel", self.scan_panel),
+            ("folder filter", self.folder_scope_panel),
+            ("file-type filter", self.file_type_scope_panel),
+            ("files panel kickoff", self.files_panel),
+            ("search panel", self.search_panel),
+            ("RAG panel", self.rag_panel),
         ):
+            phase_started = perf_counter()
             panel.set_investigation_id(investigation_id)
+            if self._workspace_load_started_at is not None:
+                self._workspace_load_timing[label] = perf_counter() - phase_started
+                if label == "folder filter":
+                    folder_timing = self.folder_scope_panel.last_reload_timing
+                    self._workspace_load_timing["folder filter query"] = float(
+                        folder_timing.get("query_seconds", 0.0)
+                    )
+                    self._workspace_load_timing["folder filter tree"] = float(
+                        folder_timing.get("populate_seconds", 0.0)
+                    )
         self.update_investigation_actions()
 
+    def _apply_workspace_dependencies(self, workspace: InvestigationWorkspace) -> None:
+        workspace_config = self.config.for_workspace(workspace.entry.workspace_path)
+        self.db = workspace.db
+        self.store = workspace.store
+        self.scan_panel.config = workspace_config
+        self.scan_panel.db = workspace.db
+        self.scan_panel.store = workspace.store
+        self.scan_panel.disappeared_panel.db = workspace.db
+        self.folder_scope_panel.db = workspace.db
+        self.files_panel.db = workspace.db
+        self.search_panel.config = workspace_config
+        self.search_panel.db = workspace.db
+        self.search_panel.store = workspace.store
+        self.rag_panel.config = workspace_config
+        self.rag_panel.db = workspace.db
+        self.rag_panel.store = workspace.store
+
     def update_investigation_actions(self) -> None:
-        has_selection = self.selected_investigation_id() is not None
+        has_selection = self.selected_workspace_id() is not None
         self.edit_button.setEnabled(has_selection)
         self.load_button.setEnabled(has_selection)
         if self.scan_panel.thread is None:
-            self.scan_panel.scan_button.setEnabled(has_selection or self.active_investigation_id() is not None)
+            self.scan_panel.scan_button.setEnabled(has_selection or self.active_workspace_id() is not None)
 
     def refresh_loaded_investigation_marker(self) -> None:
-        loaded_id = self.active_investigation_id()
+        loaded_id = self.active_workspace_id()
         loaded_name = None
         for row in range(self.investigation_list.count()):
             item = self.investigation_list.item(row)
@@ -310,7 +367,7 @@ class MainWindow(QMainWindow):
                 loaded_name = item.text()
         if loaded_name:
             self.header_investigation_label.setText(f"Investigation: {loaded_name}")
-            if self._loading_investigation_id == loaded_id:
+            if self._loading_workspace_id == loaded_id:
                 self.loaded_investigation_label.setText(f"Loading data for: {loaded_name}...")
             else:
                 self.loaded_investigation_label.setText(f"Loaded: {loaded_name}")
@@ -319,20 +376,40 @@ class MainWindow(QMainWindow):
             self.loaded_investigation_label.setText("No investigation loaded")
 
     def on_investigation_data_load_started(self, investigation_id: int) -> None:
-        if investigation_id != self.active_investigation_id():
+        if self.workspace is None or investigation_id != self.workspace.investigation_id:
             return
-        self._loading_investigation_id = investigation_id
+        self._loading_workspace_id = self.workspace.entry.id
         self.refresh_loaded_investigation_marker()
 
     def on_investigation_data_load_finished(self, investigation_id: int, _error: str) -> None:
-        if self._loading_investigation_id != investigation_id:
+        if self.workspace is None or investigation_id != self.workspace.investigation_id:
             return
-        self._loading_investigation_id = None
+        self._loading_workspace_id = None
         self.refresh_loaded_investigation_marker()
+        total_seconds = (
+            perf_counter() - self._workspace_load_started_at
+            if self._workspace_load_started_at is not None
+            else 0.0
+        )
+        file_timing = self.files_panel.last_load_timing
+        parts = [
+            *(f"{label}={seconds:.3f}s" for label, seconds in self._workspace_load_timing.items()),
+            f"file query={float(file_timing.get('query_seconds', 0.0)):.3f}s",
+            f"tree population={float(file_timing.get('populate_seconds', 0.0)):.3f}s",
+            f"folder lookup={float(file_timing.get('folder_lookup_seconds', 0.0)):.3f}s",
+            f"file widgets={float(file_timing.get('widget_seconds', 0.0)):.3f}s",
+            f"total={total_seconds:.3f}s",
+            f"files={int(file_timing.get('file_count', 0))}",
+            f"chunks={int(file_timing.get('chunk_count', 0))}",
+        ]
+        message = "Workspace load timing: " + ", ".join(parts)
+        LOGGER.info(message)
+        self.scan_panel.log_view.append(message)
+        self._workspace_load_started_at = None
 
     def scan_selected_investigation(self) -> None:
-        selected_id = self.selected_investigation_id()
-        if selected_id is not None and selected_id != self.active_investigation_id():
+        selected_id = self.selected_workspace_id()
+        if selected_id is not None and selected_id != self.active_workspace_id():
             self.set_active_investigation(selected_id)
         self.scan_panel.start_scan()
 
@@ -345,25 +422,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Investigation", "Name and at least one root folder are required.")
             return
         try:
-            investigation_id = self.db.create_investigation(name, roots, notes)
+            workspace = self.catalog.create(name, roots, notes)
         except Exception as exc:
             QMessageBox.critical(self, "Investigation", str(exc))
             return
-        self.reload_investigations(select_id=investigation_id)
-        self.set_active_investigation(investigation_id)
+        self.reload_investigations(select_id=workspace.entry.id)
+        self.set_active_investigation(workspace.entry.id)
 
     def edit_investigation(self) -> None:
-        investigation_id = self.selected_investigation_id()
-        if investigation_id is None:
+        workspace_id = self.selected_workspace_id()
+        if workspace_id is None:
             return
-        row = self.db.get_investigation(investigation_id)
+        entry = self.catalog.get(workspace_id)
+        if entry is None:
+            return
+        workspace = self.catalog.open(entry)
+        row = workspace.db.get_investigation(workspace.investigation_id)
         if row is None:
             return
         dialog = InvestigationDialog(
             self,
             name=row["name"],
             notes=row["notes"],
-            roots=self.db.get_roots(investigation_id),
+            roots=workspace.db.get_roots(workspace.investigation_id),
         )
         if dialog.exec_() != dialog.Accepted:
             return
@@ -372,13 +453,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Investigation", "Name and at least one root folder are required.")
             return
         try:
-            self.db.update_investigation(investigation_id, name, notes, roots)
+            self.catalog.update(entry, name, notes, roots)
         except Exception as exc:
             QMessageBox.critical(self, "Investigation", str(exc))
             return
-        self.reload_investigations(select_id=investigation_id)
-        if self.active_investigation_id() == investigation_id:
-            self.on_investigation_changed()
+        self.reload_investigations(select_id=workspace_id)
+        if self.active_workspace_id() == workspace_id:
+            self.set_active_investigation(workspace_id)
 
     def closeEvent(self, event) -> None:
         self.scan_panel.shutdown()

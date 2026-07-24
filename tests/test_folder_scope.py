@@ -96,6 +96,31 @@ def test_active_chunk_summaries_for_investigation_omit_chunk_text(tmp_path):
     assert "chunk_text" not in rows[0].keys()
 
 
+def test_file_browser_projection_stores_chunk_counts_and_loads_summaries_per_file(tmp_path):
+    db = SQLiteDB(tmp_path / "app.sqlite")
+    db.initialize()
+    root = tmp_path / "case"
+    investigation_id = db.create_investigation("case", [root])
+    report = root / "report.txt"
+    file_id = insert_file(db, investigation_id, report)
+    db.insert_chunks(
+        [
+            chunk(investigation_id, file_id, report, "one", "first"),
+            chunk(investigation_id, file_id, report, "two", "second", chunk_index=1),
+        ]
+    )
+
+    files = db.file_browser_files_for_investigation(investigation_id)
+    summaries = db.active_chunk_summaries_for_file(file_id)
+
+    assert files[0]["active_chunk_count"] == 2
+    assert [row["id"] for row in summaries] == ["chunk-one", "chunk-two"]
+    assert "chunk_text" not in summaries[0].keys()
+
+    db.set_chunks_inactive_for_file(file_id)
+    assert db.file_browser_files_for_investigation(investigation_id)[0]["active_chunk_count"] == 0
+
+
 def test_keyword_search_returns_display_markdown(tmp_path):
     db = SQLiteDB(tmp_path / "app.sqlite")
     db.initialize()

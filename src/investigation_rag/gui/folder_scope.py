@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from time import perf_counter
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -46,6 +48,7 @@ class FolderScopePanel(QWidget):
         self.scope = scope
         self.investigation_id: int | None = None
         self._updating = False
+        self.last_reload_timing: dict[str, float | int] = {}
 
         self.status_label = QLabel()
         self.tree = QTreeWidget()
@@ -79,17 +82,29 @@ class FolderScopePanel(QWidget):
         self.reload()
 
     def reload(self) -> None:
+        total_started = perf_counter()
         self._updating = True
         try:
             self.tree.clear()
             if self.investigation_id is None:
+                self.last_reload_timing = {"total_seconds": perf_counter() - total_started}
                 self.update_status()
                 return
+            query_started = perf_counter()
             roots = self.db.get_roots(self.investigation_id)
             folders = self.db.list_active_document_folders(self.investigation_id)
+            query_seconds = perf_counter() - query_started
+            populate_started = perf_counter()
             self.populate_tree(roots, folders)
+            populate_seconds = perf_counter() - populate_started
             self.tree.expandToDepth(0)
             self.update_status()
+            self.last_reload_timing = {
+                "query_seconds": query_seconds,
+                "populate_seconds": populate_seconds,
+                "total_seconds": perf_counter() - total_started,
+                "folder_count": len(folders),
+            }
         finally:
             self._updating = False
 
@@ -103,10 +118,13 @@ class FolderScopePanel(QWidget):
             items_by_path[root_key] = item
 
         for folder in folders:
+            folder_key = self.path_key(folder)
+            if folder_key in items_by_path:
+                continue
             root = self.best_root(folder, roots)
             if root is None:
                 item = self.add_folder_item(self.tree, str(folder), folder)
-                items_by_path.setdefault(self.path_key(folder), item)
+                items_by_path.setdefault(folder_key, item)
                 continue
 
             parent = root_items[self.path_key(root)]
@@ -223,7 +241,10 @@ class FolderScopePanel(QWidget):
 
     @staticmethod
     def path_key(path: Path) -> str:
-        return str(path.resolve()).casefold()
+        # Manifest paths are already absolute. Resolving here performs
+        # filesystem I/O for every file and parent, which is especially costly
+        # when the evidence lives on a network share.
+        return os.path.normpath(os.fspath(path)).casefold()
 
     @staticmethod
     def best_root(folder: Path, roots: list[Path]) -> Path | None:
