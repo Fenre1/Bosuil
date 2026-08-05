@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -11,7 +12,6 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
 )
 
 from investigation_rag.db.sqlite_db import SQLiteDB
+from investigation_rag.gui.chunk_preview import ChunkPreview
 from investigation_rag.gui.folder_scope import FolderScopePanel
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
 
@@ -106,8 +107,9 @@ class FilesPanel(QWidget):
         self.tree.itemSelectionChanged.connect(self.update_preview)
         self.tree.itemExpanded.connect(self.load_file_chunks)
 
-        self.preview = QTextEdit()
-        self.preview.setReadOnly(True)
+        self.preview = ChunkPreview()
+        self.preview.previous_requested.connect(lambda: self.select_adjacent_chunk(-1))
+        self.preview.next_requested.connect(lambda: self.select_adjacent_chunk(1))
 
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.reload)
@@ -380,6 +382,10 @@ class FilesPanel(QWidget):
         item.setData(0, Qt.UserRole, data)
 
     def add_chunk_item(self, parent: QTreeWidgetItem, chunk) -> QTreeWidgetItem:
+        try:
+            metadata = json.loads(chunk["metadata_json"] or "{}") if not self.lazy_load_chunk_text else {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
         item = QTreeWidgetItem(parent)
         item.setText(0, f"Chunk {int(chunk['chunk_index']) + 1}")
         item.setText(1, str(chunk["source_type"]))
@@ -392,7 +398,9 @@ class FilesPanel(QWidget):
                 "chunk_id": str(chunk["id"]),
                 "path": str(chunk["path"]),
                 "text": None if self.lazy_load_chunk_text else str(chunk["chunk_text"]),
-                "markdown": None,
+                "markdown": None if self.lazy_load_chunk_text else chunk["display_markdown"],
+                "chunk_index": int(chunk["chunk_index"]),
+                "metadata": metadata,
             },
         )
         item.setToolTip(0, "Click to show chunk content")
@@ -416,12 +424,37 @@ class FilesPanel(QWidget):
                 return
             text = str(chunk["chunk_text"])
             markdown = chunk["display_markdown"]
+            try:
+                metadata = json.loads(chunk["metadata_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
             data["text"] = text
             data["markdown"] = markdown
+            data["metadata"] = metadata
             item = self.tree.currentItem()
             if item is not None:
                 item.setData(0, Qt.UserRole, data)
-        set_chunk_preview_text(self.preview, markdown if isinstance(markdown, str) else None, str(text))
+        item = self.tree.currentItem()
+        parent = item.parent() if item is not None else None
+        row = parent.indexOfChild(item) if parent is not None and item is not None else -1
+        self.preview.set_chunk(
+            str(text),
+            markdown if isinstance(markdown, str) else None,
+            path=str(data.get("path", "")),
+            chunk_index=data.get("chunk_index"),
+            metadata=data.get("metadata") if isinstance(data.get("metadata"), dict) else {},
+            has_previous=row > 0,
+            has_next=parent is not None and row + 1 < parent.childCount(),
+        )
+
+    def select_adjacent_chunk(self, offset: int) -> None:
+        item = self.tree.currentItem()
+        parent = item.parent() if item is not None else None
+        if item is None or parent is None:
+            return
+        target = parent.indexOfChild(item) + offset
+        if 0 <= target < parent.childCount():
+            self.tree.setCurrentItem(parent.child(target))
 
     def selected_item_data(self) -> dict | None:
         item = self.tree.currentItem()
@@ -486,12 +519,3 @@ class FilesPanel(QWidget):
         if chunk["attachment_name"]:
             return f"attachment: {chunk['attachment_name']}"
         return ""
-
-
-def set_chunk_preview_text(preview: QTextEdit, display_markdown: str | None, plain_text: str) -> None:
-    if display_markdown:
-        set_markdown = getattr(preview, "setMarkdown", None)
-        if callable(set_markdown):
-            set_markdown(display_markdown)
-            return
-    preview.setPlainText(plain_text)

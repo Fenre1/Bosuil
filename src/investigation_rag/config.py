@@ -42,6 +42,7 @@ class AppConfig:
     ollama_allow_remote: bool
     ollama_timeout_seconds: int
     ollama_num_ctx: int
+    ollama_embed_num_ctx: int
     ollama_llm_model: str
     ollama_embed_model: str
     ollama_embed_query_instruction: str
@@ -61,6 +62,9 @@ class AppConfig:
     gui_lazy_load_file_chunk_text: bool
     pdf_chunk_soft_min_chars: int = 1200
     pdf_chunk_overlap_mode: str = "sentence"
+    scan_discovery_workers: int = 4
+    scan_hash_workers: int = 2
+    scan_verbose_file_limit: int = 100
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -78,6 +82,7 @@ class AppConfig:
             ollama_allow_remote=_bool_env("INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA", False),
             ollama_timeout_seconds=_positive_int_env("OLLAMA_TIMEOUT_SECONDS", 120),
             ollama_num_ctx=_positive_int_env("OLLAMA_NUM_CTX", 0),
+            ollama_embed_num_ctx=_positive_int_env("OLLAMA_EMBED_NUM_CTX", 0),
             ollama_llm_model=os.getenv("OLLAMA_LLM_MODEL", "").strip(),
             ollama_embed_model=os.getenv("OLLAMA_EMBED_MODEL", "").strip(),
             ollama_embed_query_instruction=os.getenv(
@@ -100,6 +105,9 @@ class AppConfig:
             gui_lazy_load_file_chunk_text=_bool_env("GUI_LAZY_LOAD_FILE_CHUNK_TEXT", True),
             pdf_chunk_soft_min_chars=_int_env("RAG_PDF_CHUNK_SOFT_MIN_CHARS", 1200),
             pdf_chunk_overlap_mode=os.getenv("RAG_PDF_CHUNK_OVERLAP_MODE", "sentence").strip().lower() or "sentence",
+            scan_discovery_workers=_positive_int_env("SCAN_DISCOVERY_WORKERS", 4),
+            scan_hash_workers=_positive_int_env("SCAN_HASH_WORKERS", 2),
+            scan_verbose_file_limit=_positive_int_env("SCAN_VERBOSE_FILE_LIMIT", 100),
         )
 
     def ensure_dirs(self) -> None:

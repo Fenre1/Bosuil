@@ -29,11 +29,15 @@ class OllamaClient:
         if not texts:
             return []
 
+        request_json: dict[str, Any] = {"model": model, "input": texts}
+        if self.num_ctx:
+            request_json["options"] = {"num_ctx": self.num_ctx}
+
         try:
             response = self._request(
                 "POST",
                 "/api/embed",
-                json={"model": model, "input": texts},
+                json=request_json,
             )
             if response.status_code == 404:
                 return [self._embed_legacy(model, text) for text in texts]
@@ -50,8 +54,12 @@ class OllamaClient:
         return embeddings
 
     def _embed_legacy(self, model: str, text: str) -> list[float]:
+        request_json: dict[str, Any] = {"model": model, "prompt": text}
+        if self.num_ctx:
+            request_json["options"] = {"num_ctx": self.num_ctx}
+
         try:
-            response = self._request("POST", "/api/embeddings", json={"model": model, "prompt": text})
+            response = self._request("POST", "/api/embeddings", json=request_json)
             response.raise_for_status()
             payload = response.json()
         except OllamaError:

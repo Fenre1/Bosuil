@@ -1,41 +1,118 @@
 from __future__ import annotations
 
 from threading import Event
+from time import monotonic
+from typing import Callable
 
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import QLabel, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QComboBox, QLabel, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget
 
 from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.gui.disappeared_files_panel import DisappearedFilesPanel
 from investigation_rag.ingest.pipeline import ScanPipeline
+from investigation_rag.ingest.scan_mode import ScanMode
+
+
+SCAN_LOG_MAX_BLOCKS = 2_000
+SCAN_LOG_UPDATE_INTERVAL_SECONDS = 0.5
+_ROUTINE_SCAN_LOG_PREFIXES = (
+    "Processing ",
+    "Progress: ",
+    "Unchanged, using ",
+    "Building current ",
+    "Extracting text: ",
+    "Using cached extraction: ",
+    "Queued ",
+    "Embedding batch: ",
+)
+
+
+class ScanLogSink:
+    """Coalesce high-volume per-file updates before crossing into the GUI thread."""
+
+    def __init__(
+        self,
+        emit: Callable[[str], None],
+        *,
+        update_interval_seconds: float = SCAN_LOG_UPDATE_INTERVAL_SECONDS,
+        clock: Callable[[], float] = monotonic,
+    ):
+        self._emit = emit
+        self._update_interval_seconds = max(0.0, float(update_interval_seconds))
+        self._clock = clock
+        self._last_emit_at: float | None = None
+        self._latest_progress = ""
+        self._latest_routine = ""
+        self._pending_count = 0
+
+    def __call__(self, message: str) -> None:
+        if not message.startswith(_ROUTINE_SCAN_LOG_PREFIXES):
+            self.flush()
+            self._emit(message)
+            self._last_emit_at = self._clock()
+            return
+
+        self._pending_count += 1
+        self._latest_routine = message
+        if message.startswith("Progress: "):
+            self._latest_progress = message
+        now = self._clock()
+        if self._last_emit_at is None or now - self._last_emit_at >= self._update_interval_seconds:
+            self._flush_at(now)
+
+    def flush(self) -> None:
+        self._flush_at(self._clock())
+
+    def _flush_at(self, now: float) -> None:
+        if not self._pending_count:
+            return
+        message = self._latest_progress or self._latest_routine
+        if self._pending_count > 1:
+            message += f" [coalesced {self._pending_count - 1} routine update(s)]"
+        self._emit(message)
+        self._last_emit_at = now
+        self._latest_progress = ""
+        self._latest_routine = ""
+        self._pending_count = 0
 
 
 class ScanWorker(QObject):
     log = pyqtSignal(str)
     finished = pyqtSignal(str)
 
-    def __init__(self, config: AppConfig, db: SQLiteDB, store: LanceDBStore, investigation_id: int):
+    def __init__(
+        self,
+        config: AppConfig,
+        db: SQLiteDB,
+        store: LanceDBStore,
+        investigation_id: int,
+        scan_mode: ScanMode = ScanMode.FAST,
+    ):
         super().__init__()
         self.config = config
         self.db = db
         self.store = store
         self.investigation_id = investigation_id
+        self.scan_mode = scan_mode
         self._stop_event = Event()
 
     def run(self) -> None:
+        log_sink = ScanLogSink(self.log.emit)
         try:
             pipeline = ScanPipeline(
                 self.config,
                 self.db,
                 self.store,
-                log=self.log.emit,
+                log=log_sink,
                 stop_requested=self._stop_event.is_set,
             )
-            pipeline.scan_investigation(self.investigation_id)
+            pipeline.scan_investigation(self.investigation_id, mode=self.scan_mode)
+            log_sink.flush()
             self.finished.emit("")
         except Exception as exc:
+            log_sink.flush()
             self.finished.emit(f"Scan failed: {exc}")
 
     def request_stop(self) -> None:
@@ -60,10 +137,16 @@ class ScanPanel(QWidget):
         self.stop_button.setObjectName("GhostButton")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_scan)
+        self.scan_mode = QComboBox()
+        self.scan_mode.setToolTip("Fast compares metadata; Verify hashes all files; Rebuild recreates the index.")
+        self.scan_mode.addItem("Fast rescan", ScanMode.FAST.value)
+        self.scan_mode.addItem("Verify content", ScanMode.VERIFY.value)
+        self.scan_mode.addItem("Rebuild index", ScanMode.REBUILD.value)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("Scan activity will appear here")
-        self.disappeared_panel = DisappearedFilesPanel(db)
+        self.log_view.document().setMaximumBlockCount(SCAN_LOG_MAX_BLOCKS)
+        self.disappeared_panel = DisappearedFilesPanel(db, store)
 
         scan_log_label = QLabel(" Scan log")
         scan_log_label.setObjectName("FieldLabel")
@@ -124,8 +207,15 @@ class ScanPanel(QWidget):
         self.log_view.append("Starting scan.")
         self.scan_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.scan_mode.setEnabled(False)
         thread = QThread(self)
-        worker = ScanWorker(self.config, self.db, self.store, self.investigation_id)
+        worker = ScanWorker(
+            self.config,
+            self.db,
+            self.store,
+            self.investigation_id,
+            ScanMode.parse(str(self.scan_mode.currentData())),
+        )
         self.thread = thread
         self.worker = worker
         worker.moveToThread(thread)
@@ -154,6 +244,7 @@ class ScanPanel(QWidget):
         self.worker = None
         self.scan_button.setEnabled(self.investigation_id is not None)
         self.stop_button.setEnabled(False)
+        self.scan_mode.setEnabled(True)
         self.disappeared_panel.refresh()
 
     def shutdown(self, wait_ms: int = 5000) -> None:

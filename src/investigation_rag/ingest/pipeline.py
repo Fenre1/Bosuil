@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
 from time import monotonic
 from typing import Callable
@@ -14,19 +18,20 @@ from investigation_rag.embeddings.embedding_cache import EmbeddingCache
 from investigation_rag.embeddings.ollama_client import OllamaClient, OllamaError
 from investigation_rag.extractors import get_extractor_for_path, get_extractor_version_for_suffix
 from investigation_rag.extractors.base import ExtractedDocument
-from investigation_rag.ingest.disappeared import queue_disappeared_files
 from investigation_rag.ingest.extraction_cache import ExtractionCache
 from investigation_rag.ingest.hashing import sha256_file, sha256_text
-from investigation_rag.ingest.scanner import ScannedFile, iter_supported_files
+from investigation_rag.ingest.pipeline_state import PipelineSignatures, pipeline_signatures
+from investigation_rag.ingest.scan_mode import ScanMode
+from investigation_rag.ingest.scanner import ScannedFile, scan_supported_files
+from investigation_rag.ingest.searchable_text import keyword_searchable_text, stable_embedding_text
 
 
 LogCallback = Callable[[str], None]
 StopCallback = Callable[[], bool]
-PROGRESS_LOG_INTERVAL_SECONDS = 5.0
-PROGRESS_LOG_FILE_INTERVAL = 10
+PROGRESS_LOG_INTERVAL_SECONDS = 0.5
+PROGRESS_LOG_FILE_INTERVAL = 250
 EMBEDDING_BATCH_MAX_CHUNKS = 64
 EMBEDDING_BATCH_MAX_CHARS = 180_000
-LANCEDB_OPTIMIZE_AFTER_WRITES = 1_000
 
 
 @dataclass(frozen=True)
@@ -41,8 +46,10 @@ def classify_manifest_change(existing: dict[str, object] | None, scanned: Scanne
         return ManifestDecision("new", needs_hash=True, needs_extraction=True)
     same_size = int(existing.get("size", -1)) == scanned.size
     same_modified = int(existing.get("modified_ns", -1)) == scanned.modified_ns
+    stored_stable_id = existing.get("stable_id")
+    same_identity = not stored_stable_id or not scanned.stable_id or stored_stable_id == scanned.stable_id
     has_hash = bool(existing.get("content_hash"))
-    if same_size and same_modified and has_hash:
+    if same_size and same_modified and same_identity and has_hash:
         return ManifestDecision("unchanged_metadata", needs_hash=False, needs_extraction=False)
     return ManifestDecision("suspicious_or_changed", needs_hash=True, needs_extraction=True)
 
@@ -51,8 +58,12 @@ def classify_manifest_change(existing: dict[str, object] | None, scanned: Scanne
 class ScanSummary:
     total_files: int = 0
     total_bytes: int = 0
+    entries_visited: int = 0
+    directories_visited: int = 0
+    inventory_errors: int = 0
     scanned: int = 0
     scanned_bytes: int = 0
+    hashed: int = 0
     unchanged: int = 0
     metadata_only: int = 0
     extracted: int = 0
@@ -97,13 +108,49 @@ class ScanPipeline:
         self._embedding_queue_chars = 0
         self._embedding_error_file_ids: set[int] = set()
         self._ollama_client: OllamaClient | None = None
-        self._embedded_chunk_count = 0
+        self._scan_session: object | None = None
+        self._pending_embedding_signatures: dict[int, PipelineSignatures] = {}
+        self._pending_embedding_expected: dict[int, int] = {}
+        self._embedded_vectors_by_file: dict[int, int] = {}
+        self._verbose_file_logs = True
+        self._signature_cache: dict[str, PipelineSignatures] = {}
+        self._file_notice_keys: set[str] = set()
 
     def _record_timing(self, label: str, seconds: float, count: int = 1) -> None:
         self._timings[label] = self._timings.get(label, 0.0) + seconds
         self._timing_counts[label] = self._timing_counts.get(label, 0) + count
 
-    def scan_investigation(self, investigation_id: int) -> ScanSummary:
+    def _signatures(self, suffix: str) -> PipelineSignatures:
+        key = suffix.lower()
+        signatures = self._signature_cache.get(key)
+        if signatures is None:
+            signatures = pipeline_signatures(
+                key,
+                self.chunker,
+                self.config.ollama_embed_model,
+            )
+            self._signature_cache[key] = signatures
+        return signatures
+
+    def _log_file_routine(self, message: str) -> None:
+        if self._verbose_file_logs:
+            self.log(message)
+
+    def _log_file_notice(self, key: str, message: str) -> None:
+        if self._verbose_file_logs:
+            self.log(message)
+            return
+        if key in self._file_notice_keys:
+            return
+        self._file_notice_keys.add(key)
+        self.log(f"{message} Further per-file messages of this kind are suppressed.")
+
+    def scan_investigation(
+        self,
+        investigation_id: int,
+        mode: ScanMode | str = ScanMode.FAST,
+    ) -> ScanSummary:
+        scan_mode = ScanMode.parse(mode)
         self._timings = {}
         self._timing_counts = {}
         self._slow_files = []
@@ -111,99 +158,278 @@ class ScanPipeline:
         self._embedding_queue_chars = 0
         self._embedding_error_file_ids = set()
         self._ollama_client = None
-        self._embedded_chunk_count = 0
-        roots = self.db.get_roots(investigation_id)
-        if not roots:
-            raise ValueError("Investigation has no root folders.")
-        scan_id = self.db.start_scan(investigation_id)
+        self._pending_embedding_signatures = {}
+        self._pending_embedding_expected = {}
+        self._embedded_vectors_by_file = {}
+        self._signature_cache = {}
+        self._file_notice_keys = set()
+        self._scan_session = None
         summary = ScanSummary()
         seen_file_ids: set[int] = set()
         started_at = monotonic()
+        scan_id: int | None = None
         try:
-            self.log(f"Scanning {len(roots)} root folder(s).")
-            self.log("Discovering supported files.")
-            phase_started = monotonic()
-            scanned_files, total_bytes = self._discover_supported_files(roots)
-            self._record_timing("file discovery", monotonic() - phase_started, len(scanned_files))
-            summary.total_files = len(scanned_files)
-            summary.total_bytes = total_bytes
-            if self.stop_requested():
-                summary.stopped = True
-                self._attach_and_log_timings(summary)
-                self.db.finish_scan(scan_id, "stopped", "Scan stopped during file discovery.")
-                self.log("Scan stopped. Progress was saved; run the scan again to continue.")
-                return summary
-            self.log(
-                f"Discovered {summary.total_files} supported file(s) "
-                f"({self._format_bytes(summary.total_bytes)})."
-            )
-            last_progress_at = started_at
-            for index, scanned in enumerate(scanned_files, start=1):
-                if self.stop_requested():
-                    summary.stopped = True
-                    break
-                summary.scanned += 1
-                summary.scanned_bytes += scanned.size
-                self.log(
-                    f"Processing {index}/{summary.total_files} "
-                    f"({self._format_percent(index, summary.total_files)}, "
-                    f"{self._format_bytes(scanned.size)}): "
-                    f"{scanned.path}"
+            with self.db.scan_session(investigation_id) as scan_session:
+                self._scan_session = scan_session
+                roots = self.db.get_roots(investigation_id)
+                if not roots:
+                    raise ValueError("Investigation has no root folders.")
+                scan_id = self.db.start_scan(investigation_id)
+                self.log(f"Scanning {len(roots)} root folder(s) in {scan_mode.value} mode.")
+
+                phase_started = monotonic()
+                manifest = list(scan_session.load_manifest())
+                self._record_timing("manifest preload", monotonic() - phase_started, len(manifest))
+                manifest_by_path = {str(row.normalized_path): row for row in manifest}
+
+                self.log("Discovering supported files.")
+                last_discovery_log = [monotonic()]
+
+                def discovery_progress(counters: object) -> None:
+                    now = monotonic()
+                    if now - last_discovery_log[0] < PROGRESS_LOG_INTERVAL_SECONDS:
+                        return
+                    entries = int(getattr(counters, "entries_visited", 0))
+                    supported = int(getattr(counters, "supported_files", 0))
+                    directories = int(getattr(counters, "directories_visited", 0))
+                    self.log(
+                        f"Discovery: entries={entries}, directories={directories}, supported={supported}."
+                    )
+                    last_discovery_log[0] = now
+
+                phase_started = monotonic()
+                inventory = scan_supported_files(
+                    roots,
+                    stop_requested=self.stop_requested,
+                    directory_workers=self.config.scan_discovery_workers,
+                    progress=discovery_progress,
                 )
-                try:
-                    file_started = monotonic()
-                    file_id, outcome = self._process_scanned_file(investigation_id, scanned)
-                    file_seconds = monotonic() - file_started
-                    self._record_timing("file processing", file_seconds)
-                    self._slow_files.append((file_seconds, str(scanned.path), outcome))
-                    seen_file_ids.add(file_id)
-                    if outcome == "unchanged":
+                scanned_files = list(inventory.files)
+                self._record_timing("file discovery", monotonic() - phase_started, len(scanned_files))
+                summary.total_files = len(scanned_files)
+                summary.total_bytes = int(inventory.total_bytes)
+                summary.entries_visited = int(getattr(inventory.counters, "entries_visited", 0))
+                summary.directories_visited = int(getattr(inventory.counters, "directories_visited", 0))
+                summary.inventory_errors = len(inventory.errors)
+                self._verbose_file_logs = summary.total_files <= self.config.scan_verbose_file_limit
+                self.log(
+                    f"Discovered {summary.total_files} supported file(s) "
+                    f"({self._format_bytes(summary.total_bytes)}) from "
+                    f"{summary.entries_visited} filesystem entries."
+                )
+                if not self._verbose_file_logs:
+                    self.log(
+                        "Per-file scan messages are suppressed for this large collection; "
+                        "aggregate progress and failures will still be reported."
+                    )
+                if inventory.errors:
+                    self.log(
+                        f"Inventory encountered {len(inventory.errors)} traversal error(s); "
+                        "missing files will not be marked disappeared."
+                    )
+                if inventory.cancelled or self.stop_requested():
+                    summary.stopped = True
+                    return self._finish_stopped_scan(scan_id, summary, started_at)
+
+                existing_by_path: dict[str, object] = {}
+                matched_old_ids: set[int] = set()
+                for scanned in scanned_files:
+                    existing = manifest_by_path.get(scanned.normalized_path)
+                    if existing is None:
+                        continue
+                    existing_by_path[scanned.normalized_path] = existing
+                    matched_old_ids.add(int(existing.id))
+                    seen_file_ids.add(int(existing.id))
+
+                # Portable stable IDs are hints, not proof: every path miss is
+                # hashed before an occurrence is reconnected.
+                unmatched_by_stable: dict[str, list[object]] = {}
+                for row in manifest:
+                    if (
+                        int(row.id) in matched_old_ids
+                        or not row.stable_id
+                        or str(row.status) == "inactive"
+                    ):
+                        continue
+                    unmatched_by_stable.setdefault(str(row.stable_id), []).append(row)
+                scanned_by_stable: dict[str, list[ScannedFile]] = {}
+                for scanned in scanned_files:
+                    if scanned.normalized_path in existing_by_path or not scanned.stable_id:
+                        continue
+                    scanned_by_stable.setdefault(str(scanned.stable_id), []).append(scanned)
+                stable_path_candidates: dict[str, object] = {}
+                for stable_id, scanned_candidates in scanned_by_stable.items():
+                    matches = unmatched_by_stable.get(stable_id, [])
+                    if len(matches) != 1 or len(scanned_candidates) != 1:
+                        continue
+                    existing = matches[0]
+                    if int(existing.id) not in matched_old_ids:
+                        stable_path_candidates[scanned_candidates[0].normalized_path] = existing
+
+                hash_candidates = self._hash_candidates(scanned_files, existing_by_path, scan_mode)
+                hashes, hash_errors = self._hash_files(hash_candidates)
+                summary.hashed = len(hashes)
+                identity_resolution_complete = not hash_errors
+
+                for normalized_path, existing in stable_path_candidates.items():
+                    content_hash = hashes.get(normalized_path)
+                    if not content_hash or content_hash != str(existing.content_hash or ""):
+                        continue
+                    existing_by_path[normalized_path] = existing
+                    matched_old_ids.add(int(existing.id))
+                    seen_file_ids.add(int(existing.id))
+
+                # A content hash may reconnect one unique missing occurrence, but
+                # must never collapse a copy into an already-present occurrence.
+                missing_by_hash: dict[str, list[object]] = {}
+                for row in manifest:
+                    if (
+                        int(row.id) in matched_old_ids
+                        or not row.content_hash
+                        or str(row.status) == "inactive"
+                    ):
+                        continue
+                    missing_by_hash.setdefault(str(row.content_hash), []).append(row)
+                new_by_hash: dict[str, list[ScannedFile]] = {}
+                for scanned in scanned_files:
+                    if scanned.normalized_path in existing_by_path:
+                        continue
+                    content_hash = hashes.get(scanned.normalized_path)
+                    if content_hash:
+                        new_by_hash.setdefault(content_hash, []).append(scanned)
+                if inventory.complete:
+                    for content_hash, candidates in new_by_hash.items():
+                        old_candidates = missing_by_hash.get(content_hash, [])
+                        if len(candidates) != 1 or len(old_candidates) != 1:
+                            continue
+                        scanned = candidates[0]
+                        existing = old_candidates[0]
+                        existing_by_path[scanned.normalized_path] = existing
+                        matched_old_ids.add(int(existing.id))
+                        seen_file_ids.add(int(existing.id))
+
+                last_progress_at = monotonic()
+                for index, scanned in enumerate(scanned_files, start=1):
+                    if self.stop_requested():
+                        summary.stopped = True
+                        break
+                    summary.scanned += 1
+                    summary.scanned_bytes += scanned.size
+                    existing = existing_by_path.get(scanned.normalized_path)
+                    if existing is not None:
+                        seen_file_ids.add(int(existing.id))
+
+                    if self._verbose_file_logs:
+                        self.log(
+                            f"Processing {index}/{summary.total_files} "
+                            f"({self._format_percent(index, summary.total_files)}, "
+                            f"{self._format_bytes(scanned.size)}): {scanned.path}"
+                        )
+
+                    hash_error = hash_errors.get(scanned.normalized_path)
+                    if hash_error is not None:
+                        summary.failed += 1
+                        if existing is None:
+                            identity_resolution_complete = False
+                        self.log(f"Failed to hash: {scanned.path} ({hash_error})")
+                        continue
+
+                    known_hash = hashes.get(scanned.normalized_path)
+                    if (
+                        existing is not None
+                        and known_hash is None
+                        and scan_mode is ScanMode.FAST
+                        and self._file_is_unchanged_and_current(existing, scanned)
+                    ):
                         summary.unchanged += 1
-                    elif outcome == "metadata":
-                        summary.metadata_only += 1
-                    elif outcome == "extracted":
-                        summary.extracted += 1
-                    elif outcome == "embedding_error":
-                        summary.extracted += 1
-                        summary.embedding_errors += 1
-                except Exception as exc:
-                    file_seconds = monotonic() - file_started
-                    self._record_timing("file processing", file_seconds)
-                    self._slow_files.append((file_seconds, str(scanned.path), "failed"))
-                    summary.failed += 1
-                    self.log(f"Failed: {scanned.path} ({exc})")
-                now = monotonic()
-                if self._should_log_progress(index, summary.total_files, now, last_progress_at):
-                    self.log(self._progress_text(summary, now - started_at))
-                    last_progress_at = now
-            self._flush_embedding_queue()
-            self._maybe_optimize_vector_store()
-            summary.embedding_errors = len(self._embedding_error_file_ids)
-            if summary.stopped or self.stop_requested():
-                summary.stopped = True
+                        continue
+
+                    try:
+                        file_started = monotonic()
+                        file_id, outcome = self._process_scanned_file(
+                            investigation_id,
+                            scanned,
+                            existing=existing,
+                            known_hash=known_hash,
+                            force_rebuild=scan_mode is ScanMode.REBUILD,
+                        )
+                        file_seconds = monotonic() - file_started
+                        self._record_timing("file processing", file_seconds)
+                        self._slow_files.append((file_seconds, str(scanned.path), outcome))
+                        seen_file_ids.add(file_id)
+                        if outcome == "unchanged":
+                            summary.unchanged += 1
+                        elif outcome == "metadata":
+                            summary.metadata_only += 1
+                        elif outcome == "extracted":
+                            summary.extracted += 1
+                        elif outcome == "embedding_error":
+                            summary.extracted += 1
+                            summary.embedding_errors += 1
+                    except Exception as exc:
+                        file_seconds = monotonic() - file_started
+                        self._record_timing("file processing", file_seconds)
+                        self._slow_files.append((file_seconds, str(scanned.path), "failed"))
+                        summary.failed += 1
+                        self.log(f"Failed: {scanned.path} ({exc})")
+
+                    now = monotonic()
+                    if self._should_log_progress(index, summary.total_files, now, last_progress_at):
+                        self.log(self._progress_text(summary, now - started_at))
+                        last_progress_at = now
+
+                self._flush_embedding_queue()
+                summary.embedding_errors = len(self._embedding_error_file_ids)
+                if summary.stopped or self.stop_requested():
+                    summary.stopped = True
+                    return self._finish_stopped_scan(scan_id, summary, started_at)
+
+                phase_started = monotonic()
+                scan_session.touch_seen_files(seen_file_ids)
+                self._record_timing("presence update", monotonic() - phase_started, len(seen_file_ids))
+
+                if scan_mode is ScanMode.REBUILD and self.lancedb_store is not None:
+                    phase_started = monotonic()
+                    eligible_chunk_ids = scan_session.vector_eligible_chunk_ids()
+                    removed_vectors = self.lancedb_store.reconcile_active_chunks(
+                        investigation_id,
+                        eligible_chunk_ids,
+                    )
+                    self._record_timing("LanceDB reconciliation", monotonic() - phase_started)
+                    if removed_vectors:
+                        self.log(f"Removed {removed_vectors} stale vector record(s).")
+
+                phase_started = monotonic()
+                if inventory.complete and identity_resolution_complete:
+                    active_ids = {int(row.id) for row in manifest if str(row.status) == "active"}
+                    missing_ids = active_ids - seen_file_ids
+                    summary.disappeared = scan_session.mark_disappeared(sorted(missing_ids))
+                    set_vector_activity = getattr(self.lancedb_store, "set_files_active", None)
+                    if missing_ids and callable(set_vector_activity):
+                        set_vector_activity(
+                            sorted(missing_ids),
+                            False,
+                            investigation_id=investigation_id,
+                        )
+                    if summary.disappeared:
+                        self.log(f"Queued {summary.disappeared} disappeared file(s) for review.")
+                else:
+                    self.log("Disappeared-file check skipped because inventory or identity matching was incomplete.")
+                self._record_timing("disappeared-file check", monotonic() - phase_started)
+
                 elapsed_seconds = monotonic() - started_at
-                message = self._summary_text(summary, elapsed_seconds)
                 self._attach_and_log_timings(summary)
-                self.db.finish_scan(scan_id, "stopped", message)
-                self.log("Scan stopped. Progress was saved; run the scan again to continue.")
+                message = self._summary_text(summary, elapsed_seconds)
+                self.db.finish_scan(scan_id, "finished", message)
                 self.log(message)
                 return summary
-            self.log("Checking for disappeared files.")
-            phase_started = monotonic()
-            summary.disappeared = queue_disappeared_files(self.db, investigation_id, seen_file_ids)
-            self._record_timing("disappeared-file check", monotonic() - phase_started)
-            if summary.disappeared:
-                self.log(f"Queued {summary.disappeared} disappeared file(s) for review.")
-            elapsed_seconds = monotonic() - started_at
-            self._attach_and_log_timings(summary)
-            self.db.finish_scan(scan_id, "finished", self._summary_text(summary, elapsed_seconds))
-            self.log(self._summary_text(summary, elapsed_seconds))
-            return summary
         except Exception as exc:
             self._attach_and_log_timings(summary)
-            self.db.finish_scan(scan_id, "failed", str(exc))
+            if scan_id is not None:
+                self.db.finish_scan(scan_id, "failed", str(exc))
             raise
         finally:
+            self._scan_session = None
             if self._ollama_client is not None:
                 self._ollama_client.close()
 
@@ -230,190 +456,460 @@ class ScanPipeline:
             for seconds, path, outcome in slowest:
                 self.log(f"  {self._format_duration(seconds)} [{outcome}] {path}")
 
-    def _discover_supported_files(self, roots: list[Path]) -> tuple[list[ScannedFile], int]:
-        files: list[ScannedFile] = []
-        total_bytes = 0
-        last_log_at = monotonic()
-        for scanned in iter_supported_files(roots):
-            if self.stop_requested():
-                break
-            files.append(scanned)
-            total_bytes += scanned.size
-            now = monotonic()
-            if now - last_log_at >= PROGRESS_LOG_INTERVAL_SECONDS:
-                self.log(
-                    f"Discovered {len(files)} supported file(s) so far "
-                    f"({self._format_bytes(total_bytes)})."
-                )
-                last_log_at = now
-        return files, total_bytes
+    def _finish_stopped_scan(self, scan_id: int, summary: ScanSummary, started_at: float) -> ScanSummary:
+        summary.stopped = True
+        elapsed_seconds = monotonic() - started_at
+        message = self._summary_text(summary, elapsed_seconds)
+        self._attach_and_log_timings(summary)
+        self.db.finish_scan(scan_id, "stopped", message)
+        self.log("Scan stopped. Progress was saved; run the scan again to continue.")
+        self.log(message)
+        return summary
 
-    def _process_scanned_file(self, investigation_id: int, scanned: ScannedFile) -> tuple[int, str]:
+    def _hash_candidates(
+        self,
+        scanned_files: list[ScannedFile],
+        existing_by_path: dict[str, object],
+        mode: ScanMode,
+    ) -> list[ScannedFile]:
+        candidates: list[ScannedFile] = []
+        for scanned in scanned_files:
+            existing = existing_by_path.get(scanned.normalized_path)
+            if existing is None or mode in (ScanMode.VERIFY, ScanMode.REBUILD):
+                candidates.append(scanned)
+                continue
+            decision = classify_manifest_change(self._manifest_dict(existing), scanned)
+            if decision.needs_hash:
+                candidates.append(scanned)
+        return candidates
+
+    def _hash_files(
+        self,
+        candidates: list[ScannedFile],
+    ) -> tuple[dict[str, str], dict[str, Exception]]:
+        if not candidates:
+            return {}, {}
+        hashes: dict[str, str] = {}
+        errors: dict[str, Exception] = {}
         phase_started = monotonic()
-        existing = self.db.get_file_by_path(investigation_id, scanned.normalized_path)
-        if existing is None:
-            existing = self.db.get_file_by_stable_id(investigation_id, scanned.stable_id)
+        workers = max(1, min(self.config.scan_hash_workers, len(candidates)))
 
-        existing_dict = dict(existing) if existing is not None else None
-        decision = classify_manifest_change(existing_dict, scanned)
-        self._record_timing("manifest lookup/classification", monotonic() - phase_started)
+        def hash_one(scanned: ScannedFile) -> tuple[str, float]:
+            started = monotonic()
+            before = os.stat(scanned.path, follow_symlinks=False)
+            self._assert_stat_matches_inventory(scanned, before, "before hashing")
+            content_hash = sha256_file(scanned.path)
+            after = os.stat(scanned.path, follow_symlinks=False)
+            self._assert_stat_matches_inventory(scanned, after, "after hashing")
+            if self._stat_fingerprint(before) != self._stat_fingerprint(after):
+                raise RuntimeError("file metadata changed while it was being hashed")
+            return content_hash, monotonic() - started
 
-        if existing is not None and not decision.needs_hash:
-            file_id = int(existing["id"])
-            content_hash = str(existing["content_hash"])
-            path_changed = str(existing["path"]) != str(scanned.path)
-            metadata_changed = (
-                path_changed
-                or existing["stable_id"] != scanned.stable_id
-                or str(existing["status"]) != "active"
-                or str(existing["source_type"]) != scanned.suffix.lstrip(".")
-            )
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="scan-hash") as executor:
+            pending_candidates = iter(candidates)
+            futures: dict[Future[tuple[str, float]], ScannedFile] = {}
+            inflight_limit = max(workers, workers * 2)
+
+            def fill_inflight() -> None:
+                while len(futures) < inflight_limit:
+                    try:
+                        scanned = next(pending_candidates)
+                    except StopIteration:
+                        return
+                    futures[executor.submit(hash_one, scanned)] = scanned
+
+            fill_inflight()
+            while futures:
+                if self.stop_requested():
+                    for future in futures:
+                        future.cancel()
+                completed, _ = wait(
+                    tuple(futures),
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    continue
+                for future in completed:
+                    scanned = futures.pop(future)
+                    if future.cancelled():
+                        continue
+                    try:
+                        content_hash, seconds = future.result()
+                        hashes[scanned.normalized_path] = content_hash
+                        self._slow_files.append((seconds, str(scanned.path), "hashed"))
+                    except Exception as exc:
+                        errors[scanned.normalized_path] = exc
+                if not self.stop_requested():
+                    fill_inflight()
+        self._record_timing("file hashing", monotonic() - phase_started, len(hashes))
+        return hashes, errors
+
+    @classmethod
+    def _assert_stat_matches_inventory(
+        cls,
+        scanned: ScannedFile,
+        stat_result: os.stat_result,
+        phase: str,
+    ) -> None:
+        size, modified_ns, stable_id = cls._stat_fingerprint(stat_result)
+        if size != scanned.size or modified_ns != scanned.modified_ns:
+            raise RuntimeError(f"file metadata changed {phase}")
+        if scanned.stable_id and stable_id and scanned.stable_id != stable_id:
+            raise RuntimeError(f"file identity changed {phase}")
+
+    @staticmethod
+    def _stat_fingerprint(stat_result: os.stat_result) -> tuple[int, int, str | None]:
+        modified_ns = getattr(stat_result, "st_mtime_ns", None)
+        if modified_ns is None:
+            modified_ns = int(stat_result.st_mtime * 1_000_000_000)
+        device = int(getattr(stat_result, "st_dev", 0) or 0)
+        inode = int(getattr(stat_result, "st_ino", 0) or 0)
+        stable_id = f"{device}:{inode}" if device and inode else None
+        return int(stat_result.st_size), int(modified_ns), stable_id
+
+    def _file_is_unchanged_and_current(self, existing: object, scanned: ScannedFile) -> bool:
+        decision = classify_manifest_change(self._manifest_dict(existing), scanned)
+        if decision.needs_hash:
+            return False
+        if str(getattr(existing, "status", "")) != "active":
+            return False
+        if str(getattr(existing, "path", "")) != str(scanned.path):
+            return False
+        if str(getattr(existing, "source_type", "")) != scanned.suffix.lstrip("."):
+            return False
+        return self._pipeline_action(existing, scanned.suffix) == "current"
+
+    @staticmethod
+    def _manifest_dict(existing: object) -> dict[str, object]:
+        keys = ("size", "modified_ns", "stable_id", "content_hash")
+        return {key: getattr(existing, key, None) for key in keys}
+
+    def _pipeline_action(self, existing: object, suffix: str) -> str:
+        signatures = self._signatures(suffix)
+        if not bool(getattr(existing, "pipeline_state_exists", False)):
+            return "rebuild"
+        chunks_current = (
+            str(getattr(existing, "source_content_hash", ""))
+            == str(getattr(existing, "content_hash", ""))
+            and str(getattr(existing, "extraction_signature", "")) == signatures.extraction
+            and str(getattr(existing, "chunking_signature", "")) == signatures.chunking
+            and str(getattr(existing, "metadata_signature", "")) == signatures.metadata
+            and str(getattr(existing, "extraction_status", "")) == "done"
+            and str(getattr(existing, "chunk_status", "")) == "done"
+            and str(getattr(existing, "metadata_status", "")) == "done"
+        )
+        if not chunks_current:
+            return "rebuild"
+        if not signatures.embedding_model:
+            return "current"
+        vectors_current = (
+            str(getattr(existing, "embedding_input_signature", "")) == signatures.embedding_input
+            and str(getattr(existing, "embedding_model", "")) == signatures.embedding_model
+            and str(getattr(existing, "vector_status", "")) == "done"
+            and int(getattr(existing, "active_vector_count", 0))
+            == int(getattr(existing, "active_chunk_count", 0))
+        )
+        return "current" if vectors_current else "embed"
+
+    def _set_pipeline_state(
+        self,
+        file_id: int,
+        content_hash: str,
+        signatures: PipelineSignatures,
+        *,
+        vector_status: str,
+        active_vector_count: int,
+    ) -> None:
+        if self._scan_session is None:
+            return
+        self._scan_session.update_pipeline_state(
+            file_id,
+            source_content_hash=content_hash,
+            extraction_signature=signatures.extraction,
+            chunking_signature=signatures.chunking,
+            metadata_signature=signatures.metadata,
+            embedding_input_signature=signatures.embedding_input,
+            embedding_model=signatures.embedding_model,
+            extraction_status="done",
+            chunk_status="done",
+            metadata_status="done",
+            vector_status=vector_status,
+            active_vector_count=active_vector_count,
+        )
+
+    def _set_pipeline_failure(
+        self,
+        file_id: int,
+        content_hash: str,
+        signatures: PipelineSignatures,
+        error: str,
+    ) -> None:
+        del error  # The detailed extractor error remains on the files row.
+        if self._scan_session is None:
+            return
+        self._scan_session.update_pipeline_state(
+            file_id,
+            source_content_hash=content_hash,
+            extraction_signature=signatures.extraction,
+            chunking_signature=signatures.chunking,
+            metadata_signature=signatures.metadata,
+            embedding_input_signature=signatures.embedding_input,
+            embedding_model=signatures.embedding_model,
+            extraction_status="failed",
+            chunk_status="pending",
+            metadata_status="pending",
+            vector_status="pending",
+            active_vector_count=0,
+        )
+
+    def _set_vector_state(
+        self,
+        file_id: int,
+        suffix: str,
+        status: str,
+        *,
+        active_vector_count: int,
+    ) -> None:
+        if self._scan_session is None:
+            return
+        signatures = self._signatures(suffix)
+        self._scan_session.update_pipeline_state(
+            file_id,
+            embedding_input_signature=signatures.embedding_input,
+            embedding_model=signatures.embedding_model,
+            vector_status=status,
+            active_vector_count=active_vector_count,
+        )
+
+    def _clear_pipeline_state(self, file_id: int) -> None:
+        if self._scan_session is not None:
+            self._scan_session.clear_pipeline_state(file_id)
+
+    def _process_scanned_file(
+        self,
+        investigation_id: int,
+        scanned: ScannedFile,
+        *,
+        existing: object | None,
+        known_hash: str | None,
+        force_rebuild: bool = False,
+    ) -> tuple[int, str]:
+        phase_started = monotonic()
+        existing_hash = str(getattr(existing, "content_hash", "") or "") if existing is not None else ""
+        content_hash = known_hash or existing_hash
+        if not content_hash:
+            raise RuntimeError(f"No content hash is available for {scanned.path}.")
+        file_id = int(getattr(existing, "id")) if existing is not None else None
+        path_changed = existing is not None and str(getattr(existing, "path", "")) != str(scanned.path)
+        source_type = scanned.suffix.lstrip(".")
+        stable_id = scanned.stable_id or (getattr(existing, "stable_id", None) if existing is not None else None)
+        metadata_changed = existing is not None and (
+            path_changed
+            or int(getattr(existing, "size", -1)) != scanned.size
+            or int(getattr(existing, "modified_ns", -1)) != scanned.modified_ns
+            or getattr(existing, "stable_id", None) != stable_id
+            or str(getattr(existing, "status", "")) != "active"
+            or str(getattr(existing, "source_type", "")) != source_type
+        )
+        same_content = existing is not None and existing_hash == content_hash
+        self._record_timing("manifest classification", monotonic() - phase_started)
+
+        if same_content:
             if metadata_changed:
-                self.db.upsert_file(
+                if path_changed:
+                    update_vector_path = getattr(self.lancedb_store, "update_file_path", None)
+                    if callable(update_vector_path):
+                        update_vector_path(file_id, scanned.path, investigation_id=investigation_id)
+                if str(getattr(existing, "status", "")) != "active":
+                    set_vector_activity = getattr(self.lancedb_store, "set_files_active", None)
+                    if callable(set_vector_activity):
+                        set_vector_activity([file_id], True, investigation_id=investigation_id)
+                file_id = self.db.upsert_file(
                     investigation_id=investigation_id,
                     path=scanned.path,
                     normalized_path=scanned.normalized_path,
-                    stable_id=scanned.stable_id,
+                    stable_id=stable_id,
                     size=scanned.size,
                     modified_ns=scanned.modified_ns,
                     content_hash=content_hash,
-                    source_type=scanned.suffix.lstrip("."),
+                    source_type=source_type,
                     file_id=file_id,
                 )
-                if path_changed:
-                    self.db.update_chunk_paths_for_file(file_id, scanned.path)
+                self.db.update_chunk_paths_for_file(
+                    file_id,
+                    scanned.path,
+                    size=scanned.size,
+                    modified_ns=scanned.modified_ns,
+                )
                 self.db.resolve_disappeared_for_file(file_id)
             version_outcome = self._refresh_versions_or_embeddings(
-                investigation_id, file_id, scanned.path, scanned.suffix, content_hash
+                investigation_id,
+                file_id,
+                scanned,
+                content_hash,
+                existing,
+                force_rebuild=force_rebuild,
             )
             if version_outcome is not None:
                 return file_id, version_outcome
-            return file_id, "unchanged"
-
-        phase_started = monotonic()
-        content_hash = sha256_file(scanned.path)
-        self._record_timing("file hashing", monotonic() - phase_started)
-        if existing is None:
-            existing = self.db.get_active_file_by_content_hash(investigation_id, content_hash)
-
-        file_id = int(existing["id"]) if existing is not None else None
-        if existing is not None and existing["content_hash"] == content_hash:
-            path_changed = str(existing["path"]) != str(scanned.path)
-            file_id = self.db.upsert_file(
-                investigation_id=investigation_id,
-                path=scanned.path,
-                normalized_path=scanned.normalized_path,
-                stable_id=scanned.stable_id,
-                size=scanned.size,
-                modified_ns=scanned.modified_ns,
-                content_hash=content_hash,
-                source_type=scanned.suffix.lstrip("."),
-                file_id=file_id,
-            )
-            if path_changed:
-                self.db.update_chunk_paths_for_file(file_id, scanned.path)
-            self.db.resolve_disappeared_for_file(file_id)
-            version_outcome = self._refresh_versions_or_embeddings(
-                investigation_id, file_id, scanned.path, scanned.suffix, content_hash
-            )
-            if version_outcome is not None:
-                return file_id, version_outcome
-            self.log(f"Metadata updated without re-embedding: {scanned.path}")
-            return file_id, "metadata"
+            return file_id, "metadata" if metadata_changed else "unchanged"
 
         file_id = self.db.upsert_file(
             investigation_id=investigation_id,
             path=scanned.path,
             normalized_path=scanned.normalized_path,
-            stable_id=scanned.stable_id,
+            stable_id=stable_id,
             size=scanned.size,
             modified_ns=scanned.modified_ns,
             content_hash=content_hash,
-            source_type=scanned.suffix.lstrip("."),
+            source_type=source_type,
             file_id=file_id,
         )
-        self.db.resolve_disappeared_for_file(file_id)
-        outcome = self._extract_chunk_and_embed(investigation_id, file_id, scanned.path, scanned.suffix, content_hash)
+        if existing is not None:
+            self.db.resolve_disappeared_for_file(file_id)
+            self._clear_pipeline_state(file_id)
+            self.db.set_chunks_inactive_for_file(file_id)
+            delete_vectors = getattr(self.lancedb_store, "delete_vectors_for_files", None)
+            if callable(delete_vectors):
+                delete_vectors([file_id], investigation_id=investigation_id)
+        outcome = self._extract_chunk_and_embed(
+            investigation_id,
+            file_id,
+            scanned,
+            content_hash,
+            replace_existing_vectors=False,
+        )
         return file_id, outcome
 
     def _refresh_versions_or_embeddings(
         self,
         investigation_id: int,
         file_id: int,
-        path: Path,
-        suffix: str,
+        scanned: ScannedFile,
         content_hash: str,
+        existing: object,
+        *,
+        force_rebuild: bool = False,
     ) -> str | None:
-        has_current_chunks = self.db.has_active_chunks_for_versions(
-            file_id,
-            self._extractor_version_for_suffix(suffix),
-            self._chunker_version_for_source_type(suffix.lstrip(".")),
+        path = scanned.path
+        suffix = scanned.suffix
+        action = "rebuild" if force_rebuild else self._pipeline_action(existing, suffix)
+        if action == "current":
+            return None
+        if action == "rebuild":
+            self._log_file_routine(f"Building current extraction/chunk index: {path}")
+            return self._extract_chunk_and_embed(
+                investigation_id,
+                file_id,
+                scanned,
+                content_hash,
+                replace_existing_vectors=True,
+            )
+        if self.lancedb_store is None:
+            self._set_vector_state(file_id, suffix, "unavailable", active_vector_count=0)
+            self._log_file_notice(
+                "lancedb-unavailable",
+                f"Embedding index is outdated but LanceDB is unavailable: {path}",
+            )
+            return "metadata"
+        signatures = self._signatures(suffix)
+        chunk_count = self._queue_existing_file_chunks(file_id, signatures)
+        if chunk_count == 0:
+            self.lancedb_store.delete_vectors_for_files(
+                [file_id], investigation_id=investigation_id
+            )
+            self._set_vector_state(file_id, suffix, "done", active_vector_count=0)
+            return "metadata"
+        self._set_vector_state(file_id, suffix, "pending", active_vector_count=0)
+        self._log_file_routine(
+            f"Queued existing chunks for embedding model {self.config.ollama_embed_model}: {path}"
         )
-        if not has_current_chunks:
-            extractor_version = self._extractor_version_for_suffix(suffix)
-            if not self.db.active_chunks_for_file(file_id) and self.db.file_extraction_done_for_version(file_id, extractor_version):
-                self.log(f"Unchanged with no selectable text chunks: {path}")
-                return None
-            self.log(f"Reusing extraction content but rebuilding chunks for current versions: {path}")
-            return self._extract_chunk_and_embed(investigation_id, file_id, path, suffix, content_hash)
-
-        chunk_count = self.db.active_chunk_count_for_file(file_id)
-        self.log(f"Unchanged, using {chunk_count} existing chunk(s): {path}")
-        refreshed_metadata = False
-        if self.db.active_chunks_missing_metadata(file_id):
-            self._refresh_existing_chunk_metadata(investigation_id, file_id, path, suffix, content_hash)
-            self.log(f"Refreshed chunk metadata without re-embedding: {path}")
-            refreshed_metadata = True
-        if self.db.active_chunks_need_embedding_model(file_id, self.config.ollama_embed_model):
-            if self.lancedb_store is None:
-                self.log(f"Embedding model changed but LanceDB is unavailable: {path}")
-                return "metadata" if refreshed_metadata else None
-            self._queue_existing_file_chunks(file_id)
-            self.log(f"Queued chunks for embedding model {self.config.ollama_embed_model}: {path}")
-            return "metadata"
-        if refreshed_metadata:
-            return "metadata"
-        return None
+        return "metadata"
 
     def _extract_chunk_and_embed(
         self,
         investigation_id: int,
         file_id: int,
-        path: Path,
-        suffix: str,
+        scanned: ScannedFile,
         content_hash: str,
+        *,
+        replace_existing_vectors: bool,
     ) -> str:
+        path = scanned.path
+        suffix = scanned.suffix
         source_type = suffix.lstrip(".")
         extractor_version = self._extractor_version_for_suffix(suffix)
+        signatures = self._signatures(suffix)
         try:
-            self.log(f"Extracting text: {path}")
+            self._log_file_routine(f"Extracting text: {path}")
             phase_started = monotonic()
+            self._assert_stat_matches_inventory(
+                scanned,
+                os.stat(path, follow_symlinks=False),
+                "before extraction",
+            )
             document = self._extract_document(path, content_hash, source_type)
+            self._assert_stat_matches_inventory(
+                scanned,
+                os.stat(path, follow_symlinks=False),
+                "after extraction",
+            )
             self._record_timing("text/layout extraction", monotonic() - phase_started)
             phase_started = monotonic()
             chunks = self.chunker.chunk_document(document)
             self._record_timing("chunking", monotonic() - phase_started, len(chunks))
-            records = self._chunk_records(investigation_id, file_id, path, content_hash, chunks, extractor_version)
+            records = self._chunk_records(
+                investigation_id,
+                file_id,
+                scanned,
+                content_hash,
+                chunks,
+                extractor_version,
+            )
             phase_started = monotonic()
-            self.db.set_chunks_inactive_for_file(file_id)
-            self.db.insert_chunks(records)
-            self.db.mark_file_extraction(file_id, "done", None, extractor_version)
+            batch = self._scan_session.batch() if self._scan_session is not None else nullcontext()
+            with batch:
+                self.db.set_chunks_inactive_for_file(file_id)
+                self.db.insert_chunks(records)
+                self.db.mark_file_extraction(file_id, "done", None, extractor_version)
+                self._set_pipeline_state(
+                    file_id,
+                    content_hash,
+                    signatures,
+                    vector_status="pending" if records and signatures.embedding_model else "done",
+                    active_vector_count=0,
+                )
             self._record_timing("SQLite/FTS chunk writes", monotonic() - phase_started, len(records))
+            delete_vectors = getattr(self.lancedb_store, "delete_vectors_for_files", None)
+            if replace_existing_vectors and callable(delete_vectors):
+                delete_vectors([file_id], investigation_id=investigation_id)
         except Exception as exc:
             self.db.mark_file_extraction(file_id, "failed", str(exc), extractor_version)
+            self._set_pipeline_failure(file_id, content_hash, signatures, str(exc))
             raise
 
         if not records:
-            self.log(f"No selectable text found: {path}")
+            self._log_file_routine(f"No selectable text found: {path}")
             return "extracted"
         if not self.config.ollama_embed_model:
-            self.log(f"Embedding skipped because OLLAMA_EMBED_MODEL is not configured: {path}")
+            self._log_file_notice(
+                "embedding-model-unconfigured",
+                f"Embedding skipped because OLLAMA_EMBED_MODEL is not configured: {path}",
+            )
             return "extracted"
         if self.lancedb_store is None:
-            self.log(f"Embedding skipped because LanceDB is unavailable: {path}")
+            self._set_vector_state(file_id, suffix, "unavailable", active_vector_count=0)
+            self._log_file_notice(
+                "lancedb-unavailable",
+                f"Embedding skipped because LanceDB is unavailable: {path}",
+            )
             return "extracted"
 
-        self.log(f"Queued {len(records)} chunk(s) for embedding: {path}")
+        self._log_file_routine(f"Queued {len(records)} chunk(s) for embedding: {path}")
+        self._pending_embedding_signatures[file_id] = signatures
+        self._pending_embedding_expected[file_id] = len(records)
+        self._embedded_vectors_by_file[file_id] = 0
         self._queue_embedding_records(records)
         return "extracted"
 
@@ -423,36 +919,22 @@ class ScanPipeline:
         if use_cache:
             document = self.extraction_cache.get(content_hash, extractor_version, source_type)
             if document is not None:
-                self.log(f"Using cached extraction: {path}")
+                self._log_file_routine(f"Using cached extraction: {path}")
                 return document
         document = extractor.extract(path)
         self.extraction_cache.set(content_hash, extractor_version, source_type, document)
         return document
 
-    def _refresh_existing_chunk_metadata(
-        self,
-        investigation_id: int,
-        file_id: int,
-        path: Path,
-        suffix: str,
-        content_hash: str,
-    ) -> None:
-        source_type = suffix.lstrip(".")
-        extractor_version = self._extractor_version_for_suffix(suffix)
-        document = self._extract_document(path, content_hash, source_type, use_cache=False)
-        chunks = self.chunker.chunk_document(document)
-        records = self._chunk_records(investigation_id, file_id, path, content_hash, chunks, extractor_version)
-        self.db.update_chunk_metadata(records)
-
     def _chunk_records(
         self,
         investigation_id: int,
         file_id: int,
-        path: Path,
+        scanned: ScannedFile,
         content_hash: str,
         chunks: list[Chunk],
         extractor_version: str,
     ) -> list[dict[str, object]]:
+        path = scanned.path
         records: list[dict[str, object]] = []
         for chunk in chunks:
             metadata = chunk.metadata
@@ -463,6 +945,12 @@ class ScanPipeline:
             )
             stored_metadata = dict(metadata)
             stored_metadata.update(self._display_metadata(path, chunk.source_type, metadata))
+            stored_metadata.update(
+                path=str(path),
+                filename=path.name,
+                size_bytes=scanned.size,
+                modified_ns=scanned.modified_ns,
+            )
             records.append(
                 {
                     "id": chunk_id,
@@ -486,7 +974,8 @@ class ScanPipeline:
                     "extractor_version": extractor_version,
                     "chunker_version": chunker_version,
                     "embedding_model": "",
-                    "searchable_text": self._searchable_text(path, chunk.text, metadata),
+                    "searchable_text": keyword_searchable_text(path, chunk.text, metadata),
+                    "embedding_text": stable_embedding_text(chunk.text, metadata),
                 }
             )
         return records
@@ -553,10 +1042,11 @@ class ScanPipeline:
                 self.config.ollama_base_url,
                 timeout=self.config.ollama_timeout_seconds,
                 allow_remote=self.config.ollama_allow_remote,
+                num_ctx=self.config.ollama_embed_num_ctx,
             )
         ollama = self._ollama_client
         cache = EmbeddingCache(self.db, ollama, self.config.ollama_embed_model)
-        texts = [str(record.get("searchable_text") or record["chunk_text"]) for record in records]
+        texts = [str(record.get("embedding_text") or record["chunk_text"]) for record in records]
         try:
             vectors = cache.embed_texts(texts)
         finally:
@@ -589,15 +1079,35 @@ class ScanPipeline:
         phase_started = monotonic()
         self.lancedb_store.upsert_chunks(lancedb_records)
         self._record_timing("LanceDB writes", monotonic() - phase_started, len(lancedb_records))
-        self._embedded_chunk_count += len(lancedb_records)
         phase_started = monotonic()
         self.db.update_embedding_model_for_chunks(
             [str(record["id"]) for record in records],
             self.config.ollama_embed_model,
         )
         self._record_timing("embedding metadata updates", monotonic() - phase_started, len(records))
+        completed_in_batch: dict[int, int] = {}
+        for record in records:
+            file_id = int(record["file_id"])
+            completed_in_batch[file_id] = completed_in_batch.get(file_id, 0) + 1
+        for file_id, count in completed_in_batch.items():
+            completed = self._embedded_vectors_by_file.get(file_id, 0) + count
+            self._embedded_vectors_by_file[file_id] = completed
+            expected = self._pending_embedding_expected.get(file_id, completed)
+            if completed < expected or self._scan_session is None:
+                continue
+            signatures = self._pending_embedding_signatures.get(file_id)
+            fields: dict[str, object] = {
+                "vector_status": "done",
+                "active_vector_count": completed,
+            }
+            if signatures is not None:
+                fields.update(
+                    embedding_input_signature=signatures.embedding_input,
+                    embedding_model=signatures.embedding_model,
+                )
+            self._scan_session.update_pipeline_state(file_id, fields)
 
-    def _queue_existing_file_chunks(self, file_id: int) -> None:
+    def _queue_existing_file_chunks(self, file_id: int, signatures: PipelineSignatures) -> int:
         rows = self.db.active_chunks_for_file(file_id)
         records = [
             {
@@ -607,15 +1117,21 @@ class ScanPipeline:
                 "path": row["path"],
                 "source_type": row["source_type"],
                 "chunk_text": row["chunk_text"],
-                "searchable_text": self._searchable_text(Path(str(row["path"])), row["chunk_text"], dict(row)),
+                "embedding_text": stable_embedding_text(
+                    str(row["chunk_text"]), self._stored_chunk_metadata(row)
+                ),
             }
             for row in rows
         ]
+        self._pending_embedding_signatures[file_id] = signatures
+        self._pending_embedding_expected[file_id] = len(records)
+        self._embedded_vectors_by_file[file_id] = 0
         self._queue_embedding_records(records)
+        return len(records)
 
     def _queue_embedding_records(self, records: list[dict[str, object]]) -> None:
         for record in records:
-            text = str(record.get("searchable_text") or record["chunk_text"])
+            text = str(record.get("embedding_text") or record["chunk_text"])
             if self._embedding_queue and (
                 len(self._embedding_queue) >= EMBEDDING_BATCH_MAX_CHUNKS
                 or self._embedding_queue_chars + len(text) > EMBEDDING_BATCH_MAX_CHARS
@@ -626,6 +1142,20 @@ class ScanPipeline:
         if len(self._embedding_queue) >= EMBEDDING_BATCH_MAX_CHUNKS:
             self._flush_embedding_queue()
 
+    @staticmethod
+    def _stored_chunk_metadata(row: object) -> dict[str, object]:
+        try:
+            raw = row["metadata_json"]
+        except (KeyError, TypeError, IndexError):
+            raw = None
+        metadata: dict[str, object]
+        try:
+            parsed = json.loads(str(raw)) if raw else {}
+            metadata = parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            metadata = {}
+        return metadata
+
     def _flush_embedding_queue(self) -> None:
         if not self._embedding_queue:
             return
@@ -633,54 +1163,24 @@ class ScanPipeline:
         self._embedding_queue = []
         self._embedding_queue_chars = 0
         file_ids = {int(record["file_id"]) for record in records}
-        self.log(f"Embedding batch: {len(records)} chunk(s) from {len(file_ids)} file(s).")
+        self._log_file_routine(
+            f"Embedding batch: {len(records)} chunk(s) from {len(file_ids)} file(s)."
+        )
         try:
             self._embed_records(records)
         except (OllamaError, RuntimeError) as exc:
             self._embedding_error_file_ids.update(file_ids)
+            if self._scan_session is not None:
+                for file_id in file_ids:
+                    self._scan_session.update_pipeline_state(
+                        file_id,
+                        vector_status="failed",
+                        active_vector_count=self._embedded_vectors_by_file.get(file_id, 0),
+                    )
             self.log(
                 "Embedding batch failed; keyword search remains available for "
                 f"{len(file_ids)} file(s): {exc}"
             )
-
-    def _maybe_optimize_vector_store(self) -> None:
-        if (
-            self.lancedb_store is None
-            or self._embedded_chunk_count < LANCEDB_OPTIMIZE_AFTER_WRITES
-        ):
-            return
-        phase_started = monotonic()
-        try:
-            optimized = self.lancedb_store.optimize()
-        except Exception as exc:
-            self.log(f"LanceDB compaction skipped: {exc}")
-            return
-        if optimized:
-            self._record_timing("LanceDB compaction", monotonic() - phase_started)
-            self.log(f"Compacted LanceDB after {self._embedded_chunk_count} vector write(s).")
-
-    @staticmethod
-    def _searchable_text(path: Path, chunk_text: str, metadata: dict[str, object]) -> str:
-        context_parts = [
-            f"Document path: {path}",
-            f"Document title: {path.stem}",
-        ]
-        for label, key in (
-            ("Subject", "subject"),
-            ("Subject", "email_subject"),
-            ("Sender", "sender"),
-            ("Sender", "email_sender"),
-            ("Recipients", "recipients"),
-            ("Recipients", "email_recipients"),
-            ("Date", "date"),
-            ("Date", "email_date"),
-            ("Attachment", "attachment_name"),
-            ("Parent subject", "parent_email_subject"),
-        ):
-            value = metadata.get(key)
-            if value:
-                context_parts.append(f"{label}: {value}")
-        return "\n".join([*context_parts, "", str(chunk_text)])
 
     @staticmethod
     def _should_log_progress(index: int, total_files: int, now: float, last_progress_at: float) -> bool:

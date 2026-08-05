@@ -58,6 +58,27 @@ CREATE INDEX IF NOT EXISTS idx_files_stable_id
 CREATE INDEX IF NOT EXISTS idx_files_content_hash
   ON files(investigation_id, content_hash);
 
+-- Current per-file ingest/index state.  A row is created by the scan pipeline
+-- only after it starts processing a file.  In particular, initialization does
+-- not infer or backfill state for databases created by older application
+-- versions: the absence of a row means that the file has not been processed
+-- by the current staged pipeline.
+CREATE TABLE IF NOT EXISTS file_pipeline_state (
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  source_content_hash TEXT NOT NULL DEFAULT '',
+  extraction_signature TEXT NOT NULL DEFAULT '',
+  chunking_signature TEXT NOT NULL DEFAULT '',
+  metadata_signature TEXT NOT NULL DEFAULT '',
+  embedding_input_signature TEXT NOT NULL DEFAULT '',
+  embedding_model TEXT NOT NULL DEFAULT '',
+  extraction_status TEXT NOT NULL DEFAULT 'pending',
+  chunk_status TEXT NOT NULL DEFAULT 'pending',
+  metadata_status TEXT NOT NULL DEFAULT 'pending',
+  vector_status TEXT NOT NULL DEFAULT 'pending',
+  active_vector_count INTEGER NOT NULL DEFAULT 0 CHECK(active_vector_count >= 0),
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS scan_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
@@ -78,7 +99,8 @@ CREATE TABLE IF NOT EXISTS extraction_cache (
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
-  id TEXT PRIMARY KEY,
+  fts_rowid INTEGER PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
   investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
   content_hash TEXT NOT NULL,
@@ -111,10 +133,8 @@ CREATE INDEX IF NOT EXISTS idx_chunks_text_hash
   ON chunks(chunk_text_hash, embedding_model);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  chunk_id UNINDEXED,
-  investigation_id UNINDEXED,
   chunk_text,
-  path UNINDEXED
+  path
 );
 
 CREATE TABLE IF NOT EXISTS embedding_cache (

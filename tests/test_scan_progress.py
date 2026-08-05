@@ -14,6 +14,7 @@ def app_config(tmp_path: Path) -> AppConfig:
         ollama_allow_remote=False,
         ollama_timeout_seconds=120,
         ollama_num_ctx=0,
+        ollama_embed_num_ctx=0,
         ollama_llm_model="",
         ollama_embed_model="",
         ollama_embed_query_instruction="",

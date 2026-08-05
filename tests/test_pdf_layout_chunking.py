@@ -45,7 +45,7 @@ def test_pdf_chunking_removes_recurring_headers_and_allows_page_spans():
     assert chunks[0].metadata["pages"] == [1, 2, 3]
     assert chunks[0].metadata["heading_path_text"] == "1 Risk Management"
     assert chunks[0].metadata["source_spans"][0]["char_start"] >= chunks[0].metadata["retrieval_prefix_char_count"]
-    assert chunks[0].display_markdown.startswith("# Annual Report 2025\n\n## 1 Risk Management")
+    assert chunks[0].display_markdown.startswith("Operational risk depends")
     assert "Annual Report 2025 | Page" not in chunks[0].display_markdown
 
 
@@ -72,8 +72,8 @@ def test_pdf_headings_prevent_cross_section_packing():
     assert chunks[1].metadata["heading_path_text"] == "2 Findings"
     assert "Section: 1 Risk Management" in chunks[0].text
     assert "Section: 2 Findings" in chunks[1].text
-    assert chunks[0].display_markdown.startswith("# Case Report\n\n## 1 Risk Management")
-    assert chunks[1].display_markdown.startswith("# Case Report\n\n## 2 Findings")
+    assert chunks[0].display_markdown.startswith("The first section")
+    assert chunks[1].display_markdown.startswith("The second section")
 
 
 def test_pdf_display_markdown_formats_lists_and_tables():
@@ -94,12 +94,13 @@ def test_pdf_display_markdown_formats_lists_and_tables():
 
     chunks = chunker.chunk_document(document)
 
+    assert len(chunks) == 2
     assert chunks[0].display_markdown == (
-        "# Case Report\n\n"
-        "## 1 Findings\n\n"
         "The review found:\n\n"
         "- Missing approval\n"
-        "- Late escalation\n\n"
+        "- Late escalation"
+    )
+    assert chunks[1].display_markdown == (
         "```text\n"
         "Control    Owner    Status\n"
         "Review     Alice    Open\n"
@@ -140,6 +141,69 @@ def test_pdf_visual_figure_region_stays_out_of_following_heading():
     assert results_chunks
     assert "Screened (n = 80)" not in results_chunks[0].text
     assert "The taxonomy paragraph belongs under the results heading." in results_chunks[0].text
+
+
+def test_pdf_table_is_isolated_from_surrounding_prose():
+    document = pdf_document(
+        [
+            [
+                block("Findings", 1, 0.10, font_size=16, bold=True),
+                block("The paragraph before the table explains the controls.", 1, 0.18),
+                block("Control    Owner    Status", 1, 0.30, content_type="table"),
+                block("Review     Alice    Open", 1, 0.34, content_type="table"),
+                block("The paragraph after the table explains the outcome.", 1, 0.48),
+            ]
+        ],
+        title="Case Report",
+    )
+    chunks = DeterministicChunker(
+        target_chars=900,
+        max_chars=1400,
+        overlap_chars=240,
+        pdf_soft_min_chars=1200,
+    ).chunk_document(document)
+
+    table_chunks = [chunk for chunk in chunks if chunk.metadata.get("contains_table")]
+    prose_chunks = [chunk for chunk in chunks if not chunk.metadata.get("contains_table")]
+
+    assert len(table_chunks) == 1
+    assert len(prose_chunks) == 2
+    assert "paragraph before" not in table_chunks[0].text
+    assert "paragraph after" not in table_chunks[0].text
+    assert table_chunks[0].metadata["is_structural_chunk"] is True
+    assert table_chunks[0].metadata["structural_isolation_reason"] == "isolated table region"
+    assert table_chunks[0].metadata["overlap_text"] == ""
+
+
+def test_pdf_figure_isolation_survives_soft_minimum_merging():
+    document = pdf_document(
+        [
+            [
+                block("Introductory prose belongs before the figure.", 1, 0.08, x1=0.68),
+                block("Figure 1. Screening flow", 1, 0.18, font_size=14, bold=True),
+                block("The diagram summarizes the screening process.", 1, 0.21),
+                block("It reports the number retained at every stage.", 1, 0.24),
+                block("SEARCH", 1, 0.26, x0=0.15, x1=0.30, font_size=8, bold=True),
+                block("Records (n = 100)", 1, 0.36, x0=0.15, x1=0.35, font_size=8),
+                block("Screened (n = 80)", 1, 0.47, x0=0.42, x1=0.61, font_size=8),
+                block("Included (n = 40)", 1, 0.58, x0=0.66, x1=0.84, font_size=8),
+                block("Closing prose.", 1, 0.76),
+            ]
+        ]
+    )
+    chunks = DeterministicChunker(
+        target_chars=900,
+        max_chars=1400,
+        overlap_chars=240,
+        pdf_soft_min_chars=1200,
+    ).chunk_document(document)
+
+    figure_chunks = [chunk for chunk in chunks if chunk.metadata.get("contains_figure")]
+
+    assert len(figure_chunks) == 1
+    assert "Introductory prose" not in figure_chunks[0].text
+    assert "Closing prose" not in figure_chunks[0].text
+    assert figure_chunks[0].metadata["structural_isolation_reason"] == "isolated figure region"
 
 
 def test_recurring_furniture_detection_is_edge_limited():
@@ -212,8 +276,6 @@ def test_real_1606_pdf_page_three_keeps_word_spaces():
     combined_text = "\n".join(chunk.text for chunk in page_three_chunks)
     combined_display = "\n".join(chunk.display_markdown or "" for chunk in page_three_chunks)
 
-    assert "Concrete Problems in AI Safety" in combined_display
-    assert "Overview of Research Problems" in combined_display
     assert "For concreteness, we will illustrate many of the accident risks" in combined_text
     assert "Forconcreteness,wewillillustrate" not in combined_text
     assert "Forconcreteness,wewillillustrate" not in combined_display

@@ -40,6 +40,7 @@ from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
+from investigation_rag.gui.chunk_preview import ChunkPreview
 from investigation_rag.retrieval.keyword_search import query_terms
 from investigation_rag.retrieval.ranking import SearchResult, result_location_label
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
@@ -173,9 +174,9 @@ class SearchPanel(QWidget):
         self.metadata_view = QTextEdit()
         self.metadata_view.setReadOnly(True)
         self.metadata_view.setPlaceholderText("Select a result to view metadata")
-        self.preview = QTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setPlaceholderText("Select a result to preview matching text")
+        self.preview = ChunkPreview("Select a result to preview matching text")
+        self.preview.previous_requested.connect(lambda: self.select_adjacent_result(-1))
+        self.preview.next_requested.connect(lambda: self.select_adjacent_result(1))
 
         preview_splitter = QSplitter(Qt.Vertical)
         preview_splitter.addWidget(self.metadata_view)
@@ -378,8 +379,34 @@ class SearchPanel(QWidget):
             self.preview.clear()
             return
         self.metadata_view.setHtml(metadata_html(result, self.mode_combo.currentText()))
-        set_preview_text(self.preview, result.display_markdown, result.chunk_text)
+        result_index = self.results.index(result)
+        self.preview.set_chunk(
+            result.chunk_text,
+            result.display_markdown,
+            path=result.path,
+            chunk_index=result.chunk_index,
+            metadata=result.metadata or {},
+            has_previous=result_index > 0,
+            has_next=result_index + 1 < len(self.results),
+        )
         self.highlight_preview_keywords(self.query_edit.text())
+
+    def select_adjacent_result(self, offset: int) -> None:
+        result = self.selected_result()
+        if result is None:
+            return
+        target = self.results.index(result) + offset
+        if not 0 <= target < len(self.results):
+            return
+        if self.result_stack.currentIndex() == 0:
+            self.table.selectRow(target)
+            return
+        iterator = self.tree.findItems("", Qt.MatchContains | Qt.MatchRecursive, 0)
+        for item in iterator:
+            data = item.data(0, RESULT_DATA_ROLE)
+            if isinstance(data, dict) and data.get("kind") == "result" and data.get("result_index") == target:
+                self.tree.setCurrentItem(item)
+                return
 
     def highlight_preview_keywords(self, query: str, start_position: int = 0) -> None:
         terms = query_terms(query)
@@ -558,15 +585,6 @@ def set_tree_item_row_height(item: QTreeWidgetItem, height: int) -> None:
     for column in range(item.columnCount()):
         item.setData(column, ROW_HEIGHT_ROLE, height)
         item.setSizeHint(column, QSize(0, height))
-
-
-def set_preview_text(preview: QTextEdit, display_markdown: str | None, plain_text: str) -> None:
-    if display_markdown:
-        set_markdown = getattr(preview, "setMarkdown", None)
-        if callable(set_markdown):
-            set_markdown(display_markdown)
-            return
-    preview.setPlainText(plain_text)
 
 
 def result_cell_html(
@@ -869,8 +887,9 @@ def metadata_lines(result: SearchResult) -> tuple[str, list[str]]:
 
 def metadata_items(result: SearchResult) -> tuple[str, list[tuple[str, str]]]:
     metadata = dict(result.metadata or {})
-    filename = str(metadata.pop("filename", "") or display_filename(result.path))
-    metadata.setdefault("path", result.path)
+    metadata.pop("filename", None)
+    filename = display_filename(result.path)
+    metadata["path"] = result.path
     metadata.setdefault("file_type", result.source_type)
     if result.page_number:
         metadata.setdefault("page_number", result.page_number)

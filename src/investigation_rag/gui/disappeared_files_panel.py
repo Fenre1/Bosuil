@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -13,15 +15,19 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
+from investigation_rag.ingest.hashing import sha256_file
 
 
 class DisappearedFilesPanel(QWidget):
-    def __init__(self, db: SQLiteDB):
+    def __init__(self, db: SQLiteDB, store: LanceDBStore | None = None):
         super().__init__()
         self.db = db
+        self.store = store
         self.investigation_id: int | None = None
         self.disappeared_ids: list[int] = []
+        self.file_ids: list[int] = []
 
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setObjectName("GhostButton")
@@ -67,6 +73,7 @@ class DisappearedFilesPanel(QWidget):
     def refresh(self) -> None:
         self.table.setRowCount(0)
         self.disappeared_ids = []
+        self.file_ids = []
         if self.investigation_id is None:
             self.update_action_buttons()
             return
@@ -74,6 +81,7 @@ class DisappearedFilesPanel(QWidget):
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             self.disappeared_ids.append(int(row["id"]))
+            self.file_ids.append(int(row["file_id"]))
             self.table.setItem(row_index, 0, QTableWidgetItem(row["path"]))
             self.table.setItem(row_index, 1, QTableWidgetItem(row["last_seen_at"]))
             self.table.setItem(row_index, 2, QTableWidgetItem(str(row["chunk_count"])))
@@ -94,11 +102,25 @@ class DisappearedFilesPanel(QWidget):
             return None
         return self.disappeared_ids[row]
 
+    def selected_file_id(self) -> int | None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.file_ids):
+            return None
+        return self.file_ids[row]
+
     def apply_action(self, action: str) -> None:
         disappeared_id = self.selected_disappeared_id()
-        if disappeared_id is None:
+        file_id = self.selected_file_id()
+        if disappeared_id is None or file_id is None:
             return
         try:
+            if self.store is not None:
+                if action == "keep":
+                    self.store.set_files_active(
+                        [file_id], True, investigation_id=self.investigation_id
+                    )
+                elif action == "inactive":
+                    self.store.delete_file(file_id, investigation_id=self.investigation_id)
             self.db.resolve_disappeared(disappeared_id, action)
             self.refresh()
         except Exception as exc:
@@ -106,12 +128,31 @@ class DisappearedFilesPanel(QWidget):
 
     def update_path(self) -> None:
         disappeared_id = self.selected_disappeared_id()
-        if disappeared_id is None:
+        file_id = self.selected_file_id()
+        if disappeared_id is None or file_id is None:
             return
         path, _ = QFileDialog.getOpenFileName(self, "Choose replacement file")
         if not path:
             return
         try:
+            stored_file = self.db.get_file(file_id)
+            if stored_file is None:
+                raise ValueError(f"Unknown file id {file_id}")
+            expected_hash = str(stored_file["content_hash"] or "")
+            replacement_path = Path(path)
+            expected_suffix = f".{str(stored_file['source_type']).lower().lstrip('.')}"
+            if (
+                replacement_path.suffix.lower() != expected_suffix
+                or not expected_hash
+                or sha256_file(replacement_path) != expected_hash
+            ):
+                raise ValueError(
+                    "The selected file does not have the same content as the disappeared file. "
+                    "Add it through a normal scan instead."
+                )
+            if self.store is not None:
+                self.store.update_file_path(file_id, path, investigation_id=self.investigation_id)
+                self.store.set_files_active([file_id], True, investigation_id=self.investigation_id)
             self.db.resolve_disappeared(disappeared_id, "update_path", new_path=path)
             self.refresh()
         except Exception as exc:

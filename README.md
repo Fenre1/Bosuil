@@ -30,6 +30,7 @@ OLLAMA_BASE_URL=http://127.0.0.1:11434
 INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0
 OLLAMA_TIMEOUT_SECONDS=120
 OLLAMA_NUM_CTX=32768
+OLLAMA_EMBED_NUM_CTX=16384
 OLLAMA_LLM_MODEL=<your-local-chat-model>
 OLLAMA_EMBED_MODEL=<your-local-embedding-model>
 OLLAMA_EMBED_QUERY_INSTRUCTION=Given a user question, retrieve relevant passages from a local document collection that answer the question.
@@ -39,11 +40,13 @@ By default data is stored under `%LOCALAPPDATA%\InvestigationRAG`. Real environm
 
 `INVESTIGATION_RAG_DATA_DIR` contains a small `catalog.sqlite3` plus UUID-named workspaces under `investigations\`. Each workspace contains `investigation.sqlite3`, `lancedb\`, and `manifest.json`. Copying a complete workspace directory into `investigations\` makes it discoverable on the next application start; source evidence is not copied.
 
+Evidence roots may live on SMB shares or private-cloud mounted folders. Keep the active `INVESTIGATION_RAG_DATA_DIR` on a local disk: SQLite WAL and live LanceDB files are not safe or reliably fast on many network or sync-managed folders. If a workspace must be archived or copied to private cloud, close the app first and copy the complete workspace as one unit.
+
 The app rejects non-loopback Ollama URLs by default and the Ollama client ignores proxy environment variables. Keep `INVESTIGATION_RAG_ALLOW_REMOTE_OLLAMA=0` for sensitive data. Only set it to `1` for a trusted non-sensitive setup where the Ollama server is intentionally hosted away from the same machine.
 
 For slower local models or long evidence-ledger RAG runs, raise `OLLAMA_TIMEOUT_SECONDS` in `.env`; for example, `600` waits up to ten minutes for each local Ollama request.
 
-Set `OLLAMA_NUM_CTX` to pass Ollama's `options.num_ctx` for answering-model requests. Use `32768` for a 32k context window, or set it to `0`/leave it unset to use the Ollama/model default.
+Set `OLLAMA_NUM_CTX` for answering-model requests and `OLLAMA_EMBED_NUM_CTX` for embedding requests. Set either to `0` or leave it unset to use the Ollama/model default. A 16k embedding context is ample for the default chunk sizes while using less VRAM than the model's 32k default.
 
 ## Run the Desktop App
 
@@ -74,6 +77,8 @@ investigation-rag init
 investigation-rag create-investigation --name "Case A" --root "D:\Cases\CaseA" --notes "Initial import"
 investigation-rag list-investigations
 investigation-rag scan-investigation --name "Case A"
+investigation-rag scan-investigation --name "Case A" --scan-mode verify
+investigation-rag scan-investigation --name "Case A" --scan-mode rebuild
 investigation-rag search-investigation --name "Case A" --mode keyword "invoice"
 investigation-rag search-investigation --name "Case A" --mode semantic "payments after May"
 investigation-rag ask --name "Case A" "What evidence mentions payments after May?"
@@ -84,7 +89,19 @@ If Ollama or LanceDB is unavailable, keyword search and non-embedding scan funct
 
 ## Ingest Model
 
-The v1 scan is manual only. The pipeline scans root folders, records cheap metadata first, compares with the SQLite manifest, hashes only new or suspicious files, reuses extraction and embedding caches, and avoids re-extracting or re-embedding when content hashes are unchanged. Replaced chunks are marked inactive in SQLite before new chunks are inserted.
+Scanning is manual and has three modes:
+
+- **Fast rescan** (the default) builds a metadata-only directory inventory, loads the complete SQLite manifest once, and compares path, stable identity, size, modification time, content hash, and stage signatures in memory. Files whose metadata and pipeline state are current are not hashed, extracted, written to SQLite, or embedded.
+- **Verify content** hashes every supported file, but rebuilds only content or processing stages that are actually outdated.
+- **Rebuild index** hashes every supported file, recreates current extraction, chunks, metadata/FTS, and embeddings, and reconciles stale vector records. Content-addressed extraction and embedding caches may still satisfy unchanged work.
+
+The portable inventory scanner uses bounded concurrent `os.scandir` calls and does not require an NTFS journal, USN access, administrator rights, or a local disk. It skips directory links/junctions and remains conservative when a cloud provider reports an incomplete or unreadable subtree: disappeared-file detection is skipped for that scan. `SCAN_DISCOVERY_WORKERS` and `SCAN_HASH_WORKERS` tune bounded concurrency; the defaults of 4 and 2 are intentionally modest for private-cloud filesystems. `SCAN_VERBOSE_FILE_LIMIT` controls when per-file scan messages are replaced by throttled aggregate progress.
+
+Fast mode deliberately trusts unchanged size, modification time, and identity metadata. Use Verify when a provider may preserve timestamps across content changes; use Rebuild when both content and every derived index stage should be checked and recreated.
+
+SQLite writes use one scan-scoped connection, bulk manifest/diff operations, and batched chunk/FTS updates. LanceDB table handles are reused, path-only moves do not trigger re-embedding, and expensive vector optimization is no longer part of an interactive scan. Replaced chunks are marked inactive before new chunks are inserted; disappeared files are hidden from vector search while awaiting review.
+
+Investigations ingested before the staged scan-state schema are deliberately not backfilled or inferred as current. Recreate those few investigations and ingest them as new instead of relying on a legacy upgrade path.
 
 File identity uses the available Python stat device/inode identity on Windows where practical, then falls back to path, size, modified time, and finally content hash as the truth for content changes. This keeps network-share behavior conservative.
 

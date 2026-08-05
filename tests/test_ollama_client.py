@@ -145,6 +145,54 @@ def test_generate_passes_num_ctx_when_configured(monkeypatch):
     ]
 
 
+def test_embed_passes_num_ctx_when_configured(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"embeddings": [[0.1, 0.2]]}
+
+    class FakeSession:
+        latest = None
+
+        def __init__(self):
+            self.trust_env = True
+            self.calls = []
+            FakeSession.latest = self
+
+        def request(self, method, url, timeout, **kwargs):
+            self.calls.append((method, url, timeout, kwargs, self.trust_env))
+            return FakeResponse()
+
+    class FakeRequests:
+        Session = FakeSession
+
+    monkeypatch.setitem(sys.modules, "requests", FakeRequests)
+
+    embeddings = OllamaClient("http://127.0.0.1:11434", num_ctx=16384).embed("qwen", ["text"])
+
+    assert embeddings == [[0.1, 0.2]]
+    assert FakeSession.latest is not None
+    assert FakeSession.latest.calls == [
+        (
+            "POST",
+            "http://127.0.0.1:11434/api/embed",
+            120,
+            {
+                "json": {
+                    "model": "qwen",
+                    "input": ["text"],
+                    "options": {"num_ctx": 16384},
+                }
+            },
+            False,
+        )
+    ]
+
+
 def test_generate_omits_num_ctx_when_unset(monkeypatch):
     class FakeResponse:
         def raise_for_status(self):

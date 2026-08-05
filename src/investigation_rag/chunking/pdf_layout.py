@@ -11,7 +11,7 @@ from investigation_rag.chunking.base import Chunk
 from investigation_rag.extractors.base import ExtractedDocument
 
 
-PDF_CHUNKER_ALGORITHM_VERSION = "pdf-layout-v3"
+PDF_CHUNKER_ALGORITHM_VERSION = "pdf-layout-v4"
 PDF_HEADER_FOOTER_POLICY_VERSION = "pdf-furniture-v1"
 PDF_HEADING_POLICY_VERSION = "pdf-headings-v1"
 PDF_TABLE_POLICY_VERSION = "pdf-tables-v1"
@@ -575,6 +575,15 @@ def pack_logical_units(units: list[LogicalUnit], config: PdfChunkingConfig) -> l
         current = PdfChunkDraft()
 
     for unit in units:
+        if _is_isolated_structural_unit(unit):
+            flush("before isolated structural content")
+            drafts.append(
+                PdfChunkDraft(
+                    units=[unit],
+                    boundary_reason=f"isolated {unit.content_type} content",
+                )
+            )
+            continue
         if not current.units:
             current.units.append(unit)
             continue
@@ -603,6 +612,14 @@ def pack_logical_units(units: list[LogicalUnit], config: PdfChunkingConfig) -> l
     return drafts
 
 
+def _is_isolated_structural_unit(unit: LogicalUnit) -> bool:
+    return unit.content_type in {"table", "figure"} or unit.contains_table or unit.contains_figure
+
+
+def _draft_has_isolated_structure(draft: PdfChunkDraft) -> bool:
+    return any(_is_isolated_structural_unit(unit) for unit in draft.units)
+
+
 def drafts_to_chunks(
     drafts: list[PdfChunkDraft],
     document_metadata: dict[str, Any],
@@ -617,7 +634,13 @@ def drafts_to_chunks(
     chunks: list[Chunk] = []
     for index, draft in enumerate(drafts):
         previous = drafts[index - 1] if index else None
-        if previous and previous.heading_path == draft.heading_path and config.overlap_mode != "none":
+        if (
+            previous
+            and previous.heading_path == draft.heading_path
+            and config.overlap_mode != "none"
+            and not _draft_has_isolated_structure(previous)
+            and not _draft_has_isolated_structure(draft)
+        ):
             overlap_text, overlap_spans = _structural_overlap(previous, config.overlap_mode, config.overlap_chars)
             if overlap_text and len(overlap_text) + len(draft.text) + 40 <= config.max_chars:
                 draft.overlap_text = overlap_text
@@ -652,6 +675,12 @@ def drafts_to_chunks(
                 "contains_caption": draft.contains_caption,
                 "contains_footnote": draft.contains_footnote,
                 "contains_figure": draft.contains_figure,
+                "is_structural_chunk": draft.contains_table or draft.contains_figure,
+                "structural_isolation_reason": (
+                    f"isolated {metadata_content_type} region"
+                    if (metadata_content_type := _isolated_content_type(draft))
+                    else ""
+                ),
                 "source_spans": source_spans,
                 "retrieval_prefix": prefix,
                 "retrieval_prefix_char_count": len(prefix),
@@ -1334,6 +1363,7 @@ def _merge_soft_min_drafts(drafts: list[PdfChunkDraft], config: PdfChunkingConfi
             and current.heading_path == drafts[index + 1].heading_path
             and len(current.text) + len(drafts[index + 1].text) + 2 <= config.max_chars
             and not any(unit.is_structurally_meaningful for unit in current.units)
+            and not any(unit.is_structurally_meaningful for unit in drafts[index + 1].units)
         ):
             combined = PdfChunkDraft(
                 units=[*current.units, *drafts[index + 1].units],
@@ -1350,6 +1380,7 @@ def _merge_soft_min_drafts(drafts: list[PdfChunkDraft], config: PdfChunkingConfi
                 and current.heading_path == previous.heading_path
                 and len(current.text) + len(previous.text) + 2 <= config.max_chars
                 and not any(unit.is_structurally_meaningful for unit in current.units)
+                and not any(unit.is_structurally_meaningful for unit in previous.units)
             ):
                 previous.units.extend(current.units)
                 previous.boundary_reason = "soft minimum merge"
@@ -1405,13 +1436,6 @@ def _retrieval_prefix(document_title: str, heading_label: str) -> str:
 
 def _chunk_display_markdown(document_title: str, draft: PdfChunkDraft) -> str | None:
     parts: list[str] = []
-    if document_title:
-        parts.append(f"# {_escape_markdown(document_title)}")
-    for index, heading in enumerate(draft.heading_path):
-        if document_title and index == 0 and heading.casefold() == document_title.casefold():
-            continue
-        level = min(2 + index, 6)
-        parts.append(f"{'#' * level} {_escape_markdown(heading)}")
     if draft.overlap_text:
         parts.append(_display_overlap_markdown(draft.overlap_text))
     body = draft.display_text.strip()
@@ -1456,6 +1480,14 @@ def _combined_content_type(content_types: Iterable[str]) -> str:
     if len(unique) == 1:
         return unique[0]
     return "mixed"
+
+
+def _isolated_content_type(draft: PdfChunkDraft) -> str:
+    if draft.contains_figure:
+        return "figure"
+    if draft.contains_table:
+        return "table"
+    return ""
 
 
 def _display_text(text: str, content_type: str) -> str:

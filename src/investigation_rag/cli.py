@@ -10,6 +10,7 @@ from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.embeddings.embedding_cache import EmbeddingCache
 from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.ingest.pipeline import ScanPipeline
+from investigation_rag.ingest.scan_mode import ScanMode
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
@@ -65,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser("scan-investigation", help="Manually scan an investigation.")
     add_investigation_selector(scan)
+    scan.add_argument(
+        "--scan-mode",
+        choices=[mode.value for mode in ScanMode],
+        default=ScanMode.FAST.value,
+        help="Fast metadata rescan, full content verification, or index rebuild.",
+    )
     scan.set_defaults(func=cmd_scan)
 
     search = sub.add_parser("search-investigation", help="Search one investigation.")
@@ -142,7 +149,7 @@ def cmd_scan(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCata
     pipeline = ScanPipeline(
         config.for_workspace(workspace.entry.workspace_path), workspace.db, workspace.store, log=print
     )
-    pipeline.scan_investigation(workspace.investigation_id)
+    pipeline.scan_investigation(workspace.investigation_id, mode=args.scan_mode)
     return 0
 
 
@@ -173,7 +180,7 @@ def cmd_ask(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatal
             config.ollama_base_url,
             timeout=config.ollama_timeout_seconds,
             allow_remote=config.ollama_allow_remote,
-            num_ctx=config.ollama_num_ctx,
+            num_ctx=config.ollama_embed_num_ctx,
         ),
         config.ollama_llm_model,
     )
@@ -238,6 +245,7 @@ def build_searcher(config: AppConfig, db: SQLiteDB, mode: str) -> object:
             config.ollama_base_url,
             timeout=config.ollama_timeout_seconds,
             allow_remote=config.ollama_allow_remote,
+            num_ctx=config.ollama_num_ctx,
         ),
         config.ollama_embed_model,
     )
@@ -259,6 +267,7 @@ def build_rag_searcher(config: AppConfig, db: SQLiteDB, profile_name: str = "sta
                 config.ollama_base_url,
                 timeout=config.ollama_timeout_seconds,
                 allow_remote=config.ollama_allow_remote,
+                num_ctx=config.ollama_embed_num_ctx,
             ),
             config.ollama_embed_model,
         )

@@ -40,3 +40,17 @@ def test_modified_file_is_suspicious():
 
     assert decision.reason == "suspicious_or_changed"
     assert decision.needs_hash is True
+
+
+def test_replaced_file_identity_is_suspicious_even_when_size_and_time_match():
+    existing = {
+        "size": 10,
+        "modified_ns": 123,
+        "stable_id": "1:99",
+        "content_hash": "abc",
+    }
+
+    decision = classify_manifest_change(existing, scanned_file())
+
+    assert decision.reason == "suspicious_or_changed"
+    assert decision.needs_hash is True

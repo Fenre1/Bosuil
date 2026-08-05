@@ -34,6 +34,7 @@ from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
+from investigation_rag.gui.chunk_preview import ChunkPreview
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
 from investigation_rag.retrieval.hyde import HYDE_FINAL_CHUNK_LIMIT, HYDE_LEDGER_BATCH_SIZE
@@ -340,9 +341,9 @@ class RagPanel(QWidget):
         self.citation_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.citation_table.itemSelectionChanged.connect(self.update_chunk_preview)
 
-        self.chunk_preview = QTextEdit()
-        self.chunk_preview.setReadOnly(True)
-        self.chunk_preview.setPlaceholderText("Select a citation to preview the source text")
+        self.chunk_preview = ChunkPreview("Select a citation to preview the source text")
+        self.chunk_preview.previous_requested.connect(lambda: self.select_adjacent_citation(-1))
+        self.chunk_preview.next_requested.connect(lambda: self.select_adjacent_citation(1))
 
         citation_buttons = QHBoxLayout()
         citation_buttons.setSpacing(8)
@@ -1042,10 +1043,21 @@ class RagPanel(QWidget):
         if result is None:
             self.chunk_preview.clear()
             return
-        if result.display_markdown:
-            self.chunk_preview.setMarkdown(result.display_markdown)
-        else:
-            self.chunk_preview.setPlainText(result.chunk_text)
+        row = self.citation_table.currentRow()
+        self.chunk_preview.set_chunk(
+            result.chunk_text,
+            result.display_markdown,
+            path=result.path,
+            chunk_index=result.chunk_index,
+            metadata=result.metadata or {},
+            has_previous=row > 0,
+            has_next=row + 1 < len(self.results),
+        )
+
+    def select_adjacent_citation(self, offset: int) -> None:
+        row = self.citation_table.currentRow() + offset
+        if 0 <= row < len(self.results):
+            self.citation_table.selectRow(row)
 
     def handle_answer_link(self, url: QUrl) -> None:
         action, _, value = url.toString().partition(":")

@@ -221,6 +221,7 @@ class MainWindow(QMainWindow):
 
         scan_row = QHBoxLayout()
         scan_row.setSpacing(8)
+        scan_row.addWidget(self.scan_panel.scan_mode)
         scan_row.addWidget(self.scan_panel.scan_button)
         scan_row.addWidget(self.scan_panel.stop_button)
 
@@ -336,6 +337,7 @@ class MainWindow(QMainWindow):
         self.scan_panel.db = workspace.db
         self.scan_panel.store = workspace.store
         self.scan_panel.disappeared_panel.db = workspace.db
+        self.scan_panel.disappeared_panel.store = workspace.store
         self.folder_scope_panel.db = workspace.db
         self.files_panel.db = workspace.db
         self.search_panel.config = workspace_config
