@@ -129,6 +129,51 @@ def test_update_file_path_does_not_require_new_vectors():
     ]
 
 
+def test_get_vectors_for_chunks_reads_exact_active_rows():
+    table = FakeMaintenanceTable(
+        rows=[
+            {"chunk_id": "one", "vector": [0.1, 0.2]},
+            {"chunk_id": "two", "vector": [0.3, 0.4]},
+        ]
+    )
+    store = LanceDBStore(Path("unused"))
+    store._db = FakeDB(table)
+
+    vectors = store.get_vectors_for_chunks(
+        ["one", "two", "one"],
+        investigation_id=7,
+        embedding_model="model-a",
+    )
+
+    assert vectors == {"one": [0.1, 0.2], "two": [0.3, 0.4]}
+    assert table.queries[0].where_clause == (
+        "chunk_id IN ('one', 'two') AND investigation_id = 7 AND is_active = true "
+        "AND embedding_model = 'model-a'"
+    )
+    assert table.queries[0].selected == ["chunk_id", "vector"]
+    assert table.queries[0].query_limit == 2
+
+
+def test_get_vectors_for_chunks_skips_model_filter_for_legacy_table():
+    table = FakeMaintenanceTable(rows=[{"chunk_id": "one", "vector": [0.1]}])
+    table.schema = SimpleNamespace(
+        names=[name for name in table.schema.names if name != "embedding_model"]
+    )
+    store = LanceDBStore(Path("unused"))
+    store._db = FakeDB(table)
+
+    vectors = store.get_vectors_for_chunks(
+        ["one"],
+        investigation_id=7,
+        embedding_model="model-a",
+    )
+
+    assert vectors == {"one": [0.1]}
+    assert table.queries[0].where_clause == (
+        "chunk_id IN ('one') AND investigation_id = 7 AND is_active = true"
+    )
+
+
 class FakeTable:
     def __init__(self, columns):
         self.schema = SimpleNamespace(names=columns)

@@ -25,6 +25,7 @@ from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.gui.file_type_scope import FileTypeScope, FileTypeScopePanel
+from investigation_rag.gui.entities_panel import EntitiesPanel
 from investigation_rag.gui.files_panel import FilesPanel
 from investigation_rag.gui.folder_scope import FolderScope, FolderScopePanel
 from investigation_rag.gui.investigation_dialog import InvestigationDialog
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self.file_type_scope_panel = FileTypeScopePanel(self.file_type_scope)
         self.filters_panel = self.build_filters_panel()
         self.files_panel = FilesPanel(self.db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
+        self.entities_panel = EntitiesPanel(self.db, self.store)
         self.files_panel.load_started.connect(self.on_investigation_data_load_started)
         self.files_panel.load_finished.connect(self.on_investigation_data_load_finished)
         self.search_panel = SearchPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
@@ -151,6 +153,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.scan_panel, "Onderzoeken")
         self.tabs.addTab(self.filters_panel, "Filters")
         self.tabs.addTab(self.files_panel, "Bestanden")
+        self.tabs.addTab(self.entities_panel, "Entiteiten")
         self.tabs.addTab(self.search_panel, "Zoeken")
         self.tabs.addTab(self.rag_panel, "De Uil Antwoord")
 
@@ -312,6 +315,7 @@ class MainWindow(QMainWindow):
             ("folder filter", self.folder_scope_panel),
             ("file-type filter", self.file_type_scope_panel),
             ("files panel kickoff", self.files_panel),
+            ("entities panel", self.entities_panel),
             ("search panel", self.search_panel),
             ("RAG panel", self.rag_panel),
         ):
@@ -340,6 +344,7 @@ class MainWindow(QMainWindow):
         self.scan_panel.disappeared_panel.store = workspace.store
         self.folder_scope_panel.db = workspace.db
         self.files_panel.db = workspace.db
+        self.entities_panel.set_data_sources(workspace.db, workspace.store)
         self.search_panel.config = workspace_config
         self.search_panel.db = workspace.db
         self.search_panel.store = workspace.store
@@ -466,5 +471,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.scan_panel.shutdown()
         self.files_panel.shutdown()
+        self.entities_panel.shutdown()
         self.rag_panel.shutdown()
         super().closeEvent(event)

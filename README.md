@@ -125,3 +125,34 @@ pytest
 ```
 
 The tests cover hashing, chunking, manifest change decisions, disappeared-file review behavior, and strict prompt construction.
+# Entity extraction (optional)
+
+The **Entiteiten** tab uses GLiNER large v2.5 to extract a configurable set of
+entity types from the active chunks in an investigation. Install the optional
+model dependency from the project directory:
+
+```powershell
+pip install -e ".[entities]"
+```
+
+The first extraction downloads `gliner-community/gliner_large-v2.5` from
+Hugging Face; later runs use the local model cache. Entity types in the tab are
+comma-separated zero-shot labels. Extracted mentions retain their file and
+chunk links in SQLite. Multiple selected rows can be merged under an editable
+canonical name and type; aliases are retained on later extraction runs.
+
+The **Graph** subtab visualizes the entities currently visible after applying
+the table filters. Entity rectangles contain the full entity name, use
+square-root scaling based on their number of distinct chunks, and are colored
+by entity type. Labels stay above links and chunk markers, then hide while
+their rectangle is hovered. Multiword organization names use two balanced
+lines, and words longer than 15 characters are split without truncation.
+Rectangles grow to the rendered label and are separated before display. A
+user-adjustable minimum font size reflows the drawing without rerunning the
+data or semantic layout. Semantic placement is
+calculated from the existing chunk embeddings with a deterministic UMAP-style
+local-neighborhood manifold projection. Selecting an entity
+reveals one link per shared chunk, regardless of repeated mentions inside that
+chunk. Hover a chunk marker for an excerpt or click it for the persistent full
+chunk preview. User-adjustable entity and chunk limits, plus explicit safety
+warnings for unusually dense memberships, keep large graphs manageable.

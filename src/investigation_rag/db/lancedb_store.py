@@ -201,6 +201,47 @@ class LanceDBStore:
             optimize()
             return True
 
+    def get_vectors_for_chunks(
+        self,
+        chunk_ids: Iterable[str],
+        *,
+        investigation_id: int | None = None,
+        embedding_model: str = "",
+    ) -> dict[str, list[float]]:
+        """Return stored vectors for chunk IDs without performing a similarity search."""
+        normalized_ids = list(dict.fromkeys(str(chunk_id) for chunk_id in chunk_ids))
+        if not normalized_ids:
+            return {}
+        vectors: dict[str, list[float]] = {}
+        with self._lock:
+            table = self._open_table_if_exists()
+            if table is None:
+                return vectors
+            self._require_columns(table, {"chunk_id", "vector"})
+            column_names = self._column_names(table)
+            for start in range(0, len(normalized_ids), 500):
+                batch = normalized_ids[start : start + 500]
+                encoded = ", ".join("'" + value.replace("'", "''") + "'" for value in batch)
+                where_clause = f"chunk_id IN ({encoded}){self._investigation_suffix(table, investigation_id)}"
+                if "is_active" in column_names:
+                    where_clause += " AND is_active = true"
+                if embedding_model and "embedding_model" in column_names:
+                    safe_model = embedding_model.replace("'", "''")
+                    where_clause += f" AND embedding_model = '{safe_model}'"
+                rows = (
+                    table.search()
+                    .where(where_clause)
+                    .select(["chunk_id", "vector"])
+                    .limit(len(batch))
+                    .to_list()
+                )
+                for row in rows:
+                    chunk_id = row.get("chunk_id")
+                    vector = row.get("vector")
+                    if chunk_id is not None and vector is not None:
+                        vectors[str(chunk_id)] = [float(value) for value in vector]
+        return vectors
+
     @staticmethod
     def _drop_deprecated_text_column(table: Any) -> None:
         field_names = set(table.schema.names)

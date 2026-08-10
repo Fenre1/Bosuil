@@ -199,6 +199,432 @@ class SQLiteDB:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
                 (3, utc_now()),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
+                (4, utc_now()),
+            )
+
+    def get_active_chunks_for_entity_extraction(self, investigation_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT id, file_id, chunk_text
+                FROM chunks
+                WHERE investigation_id = ? AND is_active = 1
+                ORDER BY file_id, chunk_index
+                """,
+                (investigation_id,),
+            ).fetchall()
+
+    def replace_entity_extraction(
+        self,
+        investigation_id: int,
+        mentions: list[Mapping[str, Any]],
+    ) -> None:
+        """Atomically replace machine-found mentions while retaining manual merges."""
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                DELETE FROM entity_mentions
+                WHERE entity_id IN (SELECT id FROM entities WHERE investigation_id = ?)
+                """,
+                (investigation_id,),
+            )
+            for mention in mentions:
+                normalized = str(mention["normalized_name"])
+                entity_type = str(mention["entity_type"])
+                conn.execute(
+                    """
+                    INSERT INTO entities(
+                      investigation_id, name, normalized_name, entity_type, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(investigation_id, normalized_name, entity_type)
+                    DO UPDATE SET updated_at = excluded.updated_at
+                    """,
+                    (investigation_id, mention["name"], normalized, entity_type, now, now),
+                )
+                row = conn.execute(
+                    """
+                    SELECT id, merged_into_id FROM entities
+                    WHERE investigation_id = ? AND normalized_name = ? AND entity_type = ?
+                    """,
+                    (investigation_id, normalized, entity_type),
+                ).fetchone()
+                entity_id = int(row["merged_into_id"] or row["id"])
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO entity_mentions(
+                      entity_id, file_id, chunk_id, mention_text, start_offset,
+                      end_offset, confidence, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entity_id, mention["file_id"], mention["chunk_id"], mention["mention_text"],
+                        mention["start_offset"], mention["end_offset"], mention["confidence"], now,
+                    ),
+                )
+
+    def list_entities(self, investigation_id: int) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                SELECT e.id, e.name, e.entity_type,
+                       COUNT(em.id) AS mention_count,
+                       COUNT(DISTINCT em.file_id) AS document_count
+                FROM entities e
+                JOIN entity_mentions em ON em.entity_id = e.id
+                JOIN chunks c
+                  ON c.id = em.chunk_id
+                 AND c.file_id = em.file_id
+                 AND c.investigation_id = e.investigation_id
+                 AND c.is_active = 1
+                JOIN files f
+                  ON f.id = c.file_id
+                 AND f.investigation_id = e.investigation_id
+                 AND f.status = 'active'
+                WHERE e.investigation_id = ? AND e.merged_into_id IS NULL
+                GROUP BY e.id
+                ORDER BY e.name COLLATE NOCASE, e.entity_type
+                """,
+                (investigation_id,),
+            ).fetchall()
+
+    def count_entity_chunks(
+        self,
+        investigation_id: int,
+        entity_ids: Collection[int],
+    ) -> dict[int, int]:
+        """Count distinct active chunks for each requested canonical entity."""
+        ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
+        counts = {entity_id: 0 for entity_id in ids}
+        if not ids:
+            return counts
+
+        with self.connection() as conn:
+            for start in range(0, len(ids), 900):
+                batch = ids[start:start + 900]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT e.id AS entity_id, COUNT(DISTINCT c.id) AS chunk_count
+                    FROM entities e
+                    JOIN entity_mentions em ON em.entity_id = e.id
+                    JOIN chunks c
+                      ON c.id = em.chunk_id
+                     AND c.file_id = em.file_id
+                     AND c.investigation_id = e.investigation_id
+                     AND c.is_active = 1
+                    JOIN files f
+                      ON f.id = c.file_id
+                     AND f.investigation_id = e.investigation_id
+                     AND f.status = 'active'
+                    WHERE e.investigation_id = ?
+                      AND e.merged_into_id IS NULL
+                      AND e.id IN ({placeholders})
+                    GROUP BY e.id
+                    """,
+                    (investigation_id, *batch),
+                ).fetchall()
+                for row in rows:
+                    counts[int(row["entity_id"])] = int(row["chunk_count"])
+        return counts
+
+    def list_entity_chunk_memberships(
+        self,
+        investigation_id: int,
+        entity_ids: Collection[int],
+        *,
+        include_content: bool = True,
+        max_rows: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return one active chunk membership for each requested canonical entity.
+
+        An entity can have several mentions at different offsets in one chunk.
+        The graph treats those mentions as one membership, so this query collapses
+        them while retaining separate chunks from the same document.
+        """
+        ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
+        if not ids:
+            return []
+        if max_rows is not None:
+            if max_rows < 0:
+                raise ValueError("max_rows must be non-negative or None.")
+            if max_rows == 0:
+                return []
+
+        content_columns = (
+            "c.chunk_text, c.display_markdown,"
+            if include_content
+            else "substr(c.chunk_text, 1, 320) AS chunk_snippet,"
+        )
+
+        rows: list[sqlite3.Row] = []
+        with self.connection() as conn:
+            # Stay below SQLite builds that retain the traditional 999-variable
+            # limit while still supporting graph filters with many entity IDs.
+            for start in range(0, len(ids), 900):
+                batch = ids[start:start + 900]
+                placeholders = ", ".join("?" for _ in batch)
+                limit_clause = ""
+                parameters: tuple[Any, ...] = (investigation_id, *batch)
+                if max_rows is not None:
+                    # The global first K rows must be present in the first K
+                    # rows of their own ID batch. Rank by membership depth
+                    # before entity identity so prolific entities cannot crowd
+                    # single-membership entities out of a capped graph.
+                    limit_clause = """
+                        ORDER BY membership_rank,
+                                 entity_name COLLATE NOCASE,
+                                 entity_type COLLATE NOCASE,
+                                 entity_id,
+                                 normalized_file_path COLLATE NOCASE,
+                                 chunk_index,
+                                 chunk_id
+                        LIMIT ?
+                    """
+                    parameters = (*parameters, max_rows)
+                rows.extend(
+                    conn.execute(
+                        f"""
+                        WITH distinct_memberships AS (
+                          SELECT DISTINCT
+                            e.id AS entity_id,
+                            e.name AS entity_name,
+                            e.entity_type,
+                            c.id AS chunk_id,
+                            c.chunk_index,
+                            {content_columns}
+                            c.chunk_text_hash,
+                            c.embedding_model,
+                            c.source_type,
+                            c.page_number,
+                            c.email_subject,
+                            c.email_sender,
+                            c.email_recipients,
+                            c.email_date,
+                            c.attachment_name,
+                            c.metadata_json,
+                            c.path,
+                            f.id AS file_id,
+                            f.path AS file_path,
+                            f.normalized_path AS normalized_file_path,
+                            f.parent_file_id,
+                            f.parent_attachment_name
+                          FROM entities e
+                          JOIN entity_mentions em ON em.entity_id = e.id
+                          JOIN chunks c
+                            ON c.id = em.chunk_id
+                           AND c.file_id = em.file_id
+                           AND c.investigation_id = e.investigation_id
+                          JOIN files f
+                            ON f.id = c.file_id
+                           AND f.investigation_id = e.investigation_id
+                          WHERE e.investigation_id = ?
+                            AND e.merged_into_id IS NULL
+                            AND e.id IN ({placeholders})
+                            AND c.is_active = 1
+                            AND f.status = 'active'
+                        ), ranked_memberships AS (
+                          SELECT distinct_memberships.*,
+                                 ROW_NUMBER() OVER (
+                                   PARTITION BY entity_id
+                                   ORDER BY normalized_file_path COLLATE NOCASE,
+                                            chunk_index,
+                                            chunk_id
+                                 ) AS membership_rank
+                          FROM distinct_memberships
+                        )
+                        SELECT * FROM ranked_memberships
+                        {limit_clause}
+                        """,
+                        parameters,
+                    ).fetchall()
+                )
+
+        def presentation_key(row: sqlite3.Row) -> tuple[Any, ...]:
+            return (
+                str(row["entity_name"]).casefold(),
+                str(row["entity_type"]).casefold(),
+                int(row["entity_id"]),
+                str(row["normalized_file_path"]).casefold(),
+                int(row["chunk_index"]),
+                str(row["chunk_id"]),
+            )
+
+        if max_rows is not None:
+            # Match SQLite's built-in NOCASE collation (ASCII A-Z only) so the
+            # per-batch LIMIT and the global merge use exactly the same order.
+            ascii_nocase = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+            def selection_key(row: sqlite3.Row) -> tuple[Any, ...]:
+                return (
+                    int(row["membership_rank"]),
+                    str(row["entity_name"]).translate(ascii_nocase),
+                    str(row["entity_type"]).translate(ascii_nocase),
+                    int(row["entity_id"]),
+                    str(row["normalized_file_path"]).translate(ascii_nocase),
+                    int(row["chunk_index"]),
+                    str(row["chunk_id"]),
+                )
+
+            rows.sort(key=selection_key)
+            rows = rows[:max_rows]
+        rows.sort(key=presentation_key)
+        return rows
+
+    def merge_entities(self, investigation_id: int, source_id: int, target_id: int) -> None:
+        if source_id == target_id:
+            raise ValueError("Select two different entities.")
+        with self.transaction() as conn:
+            rows = conn.execute(
+                """SELECT id, merged_into_id FROM entities
+                   WHERE investigation_id = ? AND id IN (?, ?)""",
+                (investigation_id, source_id, target_id),
+            ).fetchall()
+            if len(rows) != 2 or any(row["merged_into_id"] is not None for row in rows):
+                raise ValueError("Both entities must be active entities in this investigation.")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO entity_mentions(
+                  entity_id, file_id, chunk_id, mention_text, start_offset,
+                  end_offset, confidence, created_at
+                )
+                SELECT ?, file_id, chunk_id, mention_text, start_offset,
+                       end_offset, confidence, created_at
+                FROM entity_mentions WHERE entity_id = ?
+                """,
+                (target_id, source_id),
+            )
+            conn.execute("DELETE FROM entity_mentions WHERE entity_id = ?", (source_id,))
+            conn.execute(
+                "UPDATE entities SET merged_into_id = ?, updated_at = ? WHERE id = ?",
+                (target_id, utc_now(), source_id),
+            )
+
+    def merge_entities_as(
+        self,
+        investigation_id: int,
+        entity_ids: Collection[int],
+        name: str,
+        entity_type: str,
+    ) -> int:
+        """Merge active entities and assign their canonical display name and type."""
+        ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
+        canonical_name = " ".join(name.split())
+        canonical_type = entity_type.strip().casefold()
+        normalized_name = canonical_name.casefold()
+        if len(ids) < 2:
+            raise ValueError("Select at least two different entities.")
+        if not canonical_name or not canonical_type:
+            raise ValueError("Enter both a final name and a final type.")
+
+        placeholders = ", ".join("?" for _ in ids)
+        now = utc_now()
+        with self.transaction() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, name, normalized_name, entity_type, merged_into_id
+                FROM entities
+                WHERE investigation_id = ? AND id IN ({placeholders})
+                """,
+                (investigation_id, *ids),
+            ).fetchall()
+            rows_by_id = {int(row["id"]): row for row in rows}
+            if len(rows_by_id) != len(ids) or any(
+                row["merged_into_id"] is not None for row in rows
+            ):
+                raise ValueError("All selected entities must be active entities in this investigation.")
+
+            matching_row = next(
+                (
+                    row
+                    for row in rows
+                    if row["normalized_name"] == normalized_name
+                    and row["entity_type"] == canonical_type
+                ),
+                None,
+            )
+            target_id = int(matching_row["id"]) if matching_row is not None else ids[0]
+            target_row = rows_by_id[target_id]
+            source_ids = [entity_id for entity_id in ids if entity_id != target_id]
+
+            conflict = conn.execute(
+                """
+                SELECT id FROM entities
+                WHERE investigation_id = ? AND normalized_name = ? AND entity_type = ?
+                  AND id != ?
+                """,
+                (investigation_id, normalized_name, canonical_type, target_id),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError(
+                    "An entity with the requested final name and type already exists. "
+                    "Include it in the selection or choose another name or type."
+                )
+
+            source_placeholders = ", ".join("?" for _ in source_ids)
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO entity_mentions(
+                  entity_id, file_id, chunk_id, mention_text, start_offset,
+                  end_offset, confidence, created_at
+                )
+                SELECT ?, file_id, chunk_id, mention_text, start_offset,
+                       end_offset, confidence, created_at
+                FROM entity_mentions WHERE entity_id IN ({source_placeholders})
+                """,
+                (target_id, *source_ids),
+            )
+            conn.execute(
+                f"DELETE FROM entity_mentions WHERE entity_id IN ({source_placeholders})",
+                source_ids,
+            )
+            conn.execute(
+                f"""
+                UPDATE entities SET merged_into_id = ?, updated_at = ?
+                WHERE id IN ({source_placeholders})
+                """,
+                (target_id, now, *source_ids),
+            )
+            conn.execute(
+                f"""
+                UPDATE entities SET merged_into_id = ?, updated_at = ?
+                WHERE merged_into_id IN ({source_placeholders})
+                """,
+                (target_id, now, *source_ids),
+            )
+
+            old_name = str(target_row["name"])
+            old_normalized_name = str(target_row["normalized_name"])
+            old_type = str(target_row["entity_type"])
+            conn.execute(
+                """
+                UPDATE entities
+                SET name = ?, normalized_name = ?, entity_type = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (canonical_name, normalized_name, canonical_type, now, target_id),
+            )
+            if (old_normalized_name, old_type) != (normalized_name, canonical_type):
+                conn.execute(
+                    """
+                    INSERT INTO entities(
+                      investigation_id, name, normalized_name, entity_type,
+                      merged_into_id, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        investigation_id,
+                        old_name,
+                        old_normalized_name,
+                        old_type,
+                        target_id,
+                        now,
+                        now,
+                    ),
+                )
+        return target_id
 
     def create_investigation(self, name: str, roots: list[Path], notes: str = "") -> int:
         now = utc_now()
