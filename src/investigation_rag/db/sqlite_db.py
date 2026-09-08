@@ -92,6 +92,20 @@ class SQLiteDB:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    def backup_to(self, destination: Path) -> None:
+        """Write a transactionally consistent copy without copying WAL sidecars."""
+
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = self.connect()
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+            source.close()
+
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         active = self._active_scan_connection()
@@ -203,18 +217,75 @@ class SQLiteDB:
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
                 (4, utc_now()),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
+                (5, utc_now()),
+            )
 
     def get_active_chunks_for_entity_extraction(self, investigation_id: int) -> list[sqlite3.Row]:
         with self.connection() as conn:
             return conn.execute(
                 """
-                SELECT id, file_id, chunk_text
-                FROM chunks
-                WHERE investigation_id = ? AND is_active = 1
-                ORDER BY file_id, chunk_index
+                SELECT c.id, c.file_id, c.chunk_index, c.chunk_text, c.path,
+                       c.source_type, c.content_hash
+                FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.investigation_id = ?
+                  AND c.is_active = 1
+                  AND f.status = 'active'
+                ORDER BY c.file_id, c.chunk_index
                 """,
                 (investigation_id,),
             ).fetchall()
+
+    def get_entity_extraction_cache(
+        self,
+        document_text_hash: str,
+        extraction_signature: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT model_name, raw_output, parsed_json, created_at
+                FROM entity_extraction_cache
+                WHERE document_text_hash = ? AND extraction_signature = ?
+                """,
+                (document_text_hash, extraction_signature),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "model_name": str(row["model_name"]),
+            "raw_output": str(row["raw_output"]),
+            "parsed": json.loads(str(row["parsed_json"])),
+            "created_at": str(row["created_at"]),
+        }
+
+    def set_entity_extraction_cache(
+        self,
+        document_text_hash: str,
+        extraction_signature: str,
+        model_name: str,
+        raw_output: str,
+        parsed: list[Mapping[str, Any]],
+    ) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO entity_extraction_cache(
+                  document_text_hash, extraction_signature, model_name,
+                  raw_output, parsed_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_text_hash,
+                    extraction_signature,
+                    model_name,
+                    raw_output,
+                    json.dumps(parsed, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
 
     def replace_entity_extraction(
         self,

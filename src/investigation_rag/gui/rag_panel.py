@@ -27,7 +27,6 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from investigation_rag.cli import build_rag_searcher
 from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
@@ -35,18 +34,14 @@ from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.gui.file_type_scope import FileTypeScope
 from investigation_rag.gui.folder_scope import FolderScope
 from investigation_rag.gui.chunk_preview import ChunkPreview
-from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.prompt_builder import ConversationTurn
-from investigation_rag.retrieval.hyde import HYDE_FINAL_CHUNK_LIMIT, HYDE_LEDGER_BATCH_SIZE
+from investigation_rag.rag.runner import LEDGER_PROFILE_NAMES, RagRunner
 from investigation_rag.retrieval.ranking import SearchResult, result_location_label
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
     ANSWER_STYLE_LENIENT,
-    EVIDENCE_LEDGER_BATCH_SIZE,
-    EVIDENCE_LEDGER_CHUNK_LIMIT,
     RAGAnswer,
     ANSWER_STYLE_STRICT,
-    StrictAnswerer,
 )
 from investigation_rag.utils.windows_open import open_containing_folder, open_file
 
@@ -54,7 +49,6 @@ from investigation_rag.utils.windows_open import open_containing_folder, open_fi
 CITATION_REF_RE = re.compile(r"\[(\d+)\]")
 LEDGER_REF_RE = re.compile(r"\[E(\d+)\]", re.IGNORECASE)
 DEFAULT_ANSWER_MODEL = "qwen3.6:latest"
-LEDGER_PROFILE_NAMES = {"ledger", "hyde"}
 
 
 @dataclass
@@ -168,50 +162,20 @@ class RagAskWorker(QObject):
 
     def run(self) -> None:
         try:
-            db = SQLiteDB(self.config.sqlite_path)
-            llm = OllamaLLM(
-                OllamaClient(
-                    self.config.ollama_base_url,
-                    timeout=self.config.ollama_timeout_seconds,
-                    allow_remote=self.config.ollama_allow_remote,
-                    num_ctx=self.config.ollama_num_ctx,
-                ),
+            with RagRunner(
+                self.config,
+                self.investigation_id,
+                self.profile_name,
+                self.answer_style,
                 self.answer_model,
-            )
-            searcher_profile = "standard" if self.profile_name == "ledger" else self.profile_name
-            searcher = build_rag_searcher(self.config, db, searcher_profile, llm)
-            answerer = StrictAnswerer(searcher, llm)
-            if self.profile_name in LEDGER_PROFILE_NAMES:
-                if self.profile_name == "hyde":
-                    progress_message = "Building Hyde evidence ledger in the background."
-                    chunk_limit = HYDE_FINAL_CHUNK_LIMIT
-                    batch_size = HYDE_LEDGER_BATCH_SIZE
-                else:
-                    progress_message = "Building evidence ledger in the background."
-                    chunk_limit = EVIDENCE_LEDGER_CHUNK_LIMIT
-                    batch_size = EVIDENCE_LEDGER_BATCH_SIZE
-                self.progress.emit(self.request_id, progress_message)
-                response = answerer.answer_with_evidence_ledger(
-                    self.investigation_id,
+                self.folder_paths,
+                self.source_types,
+            ) as runner:
+                response = runner.answer(
                     self.question,
                     history=self.history,
-                    folder_paths=self.folder_paths,
-                    source_types=self.source_types,
                     progress_callback=lambda message: self.progress.emit(self.request_id, message),
                     ledger_callback=lambda ledger: self.ledger_updated.emit(self.request_id, ledger),
-                    answer_style=self.answer_style,
-                    chunk_limit=chunk_limit,
-                    batch_size=batch_size,
-                )
-            else:
-                self.progress.emit(self.request_id, "Retrieving evidence and generating the answer in the background.")
-                response = answerer.answer(
-                    self.investigation_id,
-                    self.question,
-                    history=self.history,
-                    folder_paths=self.folder_paths,
-                    source_types=self.source_types,
-                    answer_style=self.answer_style,
                 )
             result = RagAskResult(
                 request_id=self.request_id,

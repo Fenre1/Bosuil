@@ -26,7 +26,9 @@ class LanceDBStore:
         except ImportError as exc:
             raise LanceDBUnavailable("LanceDB is not installed. Install project dependencies to enable vector search.") from exc
         self.db_dir.mkdir(parents=True, exist_ok=True)
-        self._db = lancedb.connect(str(self.db_dir))
+        # The local table catalog is deliberately used here. A manifest-based
+        # namespace can persist an absolute file:// URI and break after a move.
+        self._db = lancedb.connect(str(self.db_dir), manifest_enabled=False)
         return self._db
 
     def has_table(self) -> bool:

@@ -77,16 +77,26 @@ class WorkspaceCatalog:
                 continue
             if workspace_path.name != workspace_id:
                 continue
-            with self._connection() as conn:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO workspaces(
-                        id, name, workspace_path, created_at, updated_at
+            try:
+                with self._connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO workspaces(
+                            id, name, workspace_path, created_at, updated_at
+                        )
+                        VALUES(?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            name = excluded.name,
+                            workspace_path = excluded.workspace_path,
+                            updated_at = excluded.updated_at
+                        """,
+                        (workspace_id, name, str(workspace_path), created_at, updated_at),
                     )
-                    VALUES(?, ?, ?, ?, ?)
-                    """,
-                    (workspace_id, name, str(workspace_path), created_at, updated_at),
-                )
+            except sqlite3.IntegrityError:
+                # A separately created workspace may already own the same name.
+                # Leave that conflict for an explicit import instead of making
+                # every otherwise valid workspace undiscoverable.
+                continue
 
     def list(self) -> list[WorkspaceEntry]:
         with self._connection() as conn:
@@ -173,8 +183,19 @@ class WorkspaceCatalog:
         return WorkspaceEntry(entry.id, name, entry.workspace_path)
 
     def open(self, entry: WorkspaceEntry) -> InvestigationWorkspace:
-        db = SQLiteDB(entry.workspace_path / "investigation.sqlite3")
+        database_path = entry.workspace_path / "investigation.sqlite3"
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                "Investigation database not found at the catalogued workspace path: "
+                f"{database_path}. Refresh the catalog or import the workspace again."
+            )
+        db = SQLiteDB(database_path)
         db.initialize()
+        if db.get_investigation(WORKSPACE_INVESTIGATION_ID) is None:
+            raise RuntimeError(
+                f"Investigation database {database_path} does not contain investigation ID "
+                f"{WORKSPACE_INVESTIGATION_ID}."
+            )
         return InvestigationWorkspace(entry, db, LanceDBStore(entry.workspace_path / "lancedb"))
 
     @contextmanager

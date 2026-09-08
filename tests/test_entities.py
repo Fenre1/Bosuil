@@ -1,17 +1,33 @@
+import pytest
+
 from investigation_rag.db.sqlite_db import SQLiteDB, utc_now
-from investigation_rag.entities import extract_entities, normalize_entity_name
+from investigation_rag.embeddings.ollama_client import OllamaGeneration
+from investigation_rag.entities import (
+    EntityChunk,
+    EntityDocument,
+    EntityExtractionCancelled,
+    EntityOutputMalformed,
+    ParsedEntity,
+    extract_entities,
+    locate_entity_mentions,
+    normalize_entity_name,
+    parse_entity_output,
+    stitch_chunk_texts,
+)
 
 
-class FakeGLiNER:
-    def predict_entities(self, text, labels, threshold):
-        results = []
-        for name, label in (("Alice", "person"), ("ACME", "organization")):
-            start = text.find(name)
-            if start >= 0 and label in labels:
-                results.append(
-                    {"text": name, "label": label, "start": start, "end": start + len(name), "score": 0.9}
-                )
-        return results
+class FakeEntityGenerator:
+    def __init__(self):
+        self.prompts = []
+
+    def generate(self, prompt):
+        self.prompts.append(prompt)
+        lines = []
+        if "Alice" in prompt:
+            lines.append("Alice [Person]")
+        if "ACME" in prompt:
+            lines.append("ACME [Organization]")
+        return "\n".join(lines)
 
 
 def make_database(tmp_path):
@@ -72,7 +88,7 @@ def add_entity_mention(db, investigation_id, name, entity_type):
 def test_extracts_unique_entities_and_retains_document_mentions(tmp_path):
     db, investigation_id = make_database(tmp_path)
     mention_count = extract_entities(
-        db, investigation_id, ["person", "organization"], model=FakeGLiNER()
+        db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator()
     )
 
     assert mention_count == 3
@@ -85,11 +101,11 @@ def test_extracts_unique_entities_and_retains_document_mentions(tmp_path):
 
 def test_merge_survives_reextraction(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     entities = {row["name"]: row for row in db.list_entities(investigation_id)}
     db.merge_entities(investigation_id, entities["ACME"]["id"], entities["Alice"]["id"])
 
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
 
     remaining = db.list_entities(investigation_id)
     assert [(row["name"], row["mention_count"]) for row in remaining] == [("Alice", 3)]
@@ -97,7 +113,7 @@ def test_merge_survives_reextraction(tmp_path):
 
 def test_merges_multiple_entities_with_a_new_name_and_type(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     add_entity_mention(db, investigation_id, "A. Smith", "person")
     entities = db.list_entities(investigation_id)
 
@@ -114,7 +130,7 @@ def test_merges_multiple_entities_with_a_new_name_and_type(tmp_path):
         for row in remaining
     ] == [(target_id, "Alice Smith", "subject", 4)]
 
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     remaining = db.list_entities(investigation_id)
     assert [(row["name"], row["entity_type"], row["mention_count"]) for row in remaining] == [
         ("Alice Smith", "subject", 3)
@@ -123,7 +139,7 @@ def test_merges_multiple_entities_with_a_new_name_and_type(tmp_path):
 
 def test_multi_merge_can_use_the_name_and_type_of_any_selected_entity(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     entities = {row["name"]: row for row in db.list_entities(investigation_id)}
 
     target_id = db.merge_entities_as(
@@ -146,7 +162,7 @@ def test_entity_name_normalization_is_case_and_whitespace_insensitive():
 
 def test_list_entities_counts_only_mentions_from_active_chunks_and_files(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     with db.transaction() as conn:
         conn.execute("UPDATE chunks SET is_active = 0 WHERE id = 'chunk-1'")
 
@@ -168,7 +184,7 @@ def test_list_entities_counts_only_mentions_from_active_chunks_and_files(tmp_pat
 
 def test_entity_chunk_memberships_collapse_duplicate_mentions_in_one_chunk(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     alice = next(row for row in db.list_entities(investigation_id) if row["name"] == "Alice")
     now = utc_now()
     with db.transaction() as conn:
@@ -193,7 +209,7 @@ def test_entity_chunk_memberships_collapse_duplicate_mentions_in_one_chunk(tmp_p
 
 def test_entity_chunk_counts_collapse_mentions_and_ignore_inactive_sources(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     entities = {row["name"]: row for row in db.list_entities(investigation_id)}
     alice_id = entities["Alice"]["id"]
     acme_id = entities["ACME"]["id"]
@@ -237,7 +253,7 @@ def test_entity_chunk_counts_collapse_mentions_and_ignore_inactive_sources(tmp_p
 
 def test_entity_chunk_memberships_keep_distinct_chunks_from_one_document(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     alice = next(row for row in db.list_entities(investigation_id) if row["name"] == "Alice")
 
     rows = db.list_entity_chunk_memberships(investigation_id, [alice["id"]])
@@ -252,7 +268,7 @@ def test_entity_chunk_memberships_keep_distinct_chunks_from_one_document(tmp_pat
 
 def test_entity_chunk_memberships_use_the_merged_canonical_entity(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     entities = {row["name"]: row for row in db.list_entities(investigation_id)}
     source_id = entities["ACME"]["id"]
     target_id = entities["Alice"]["id"]
@@ -351,7 +367,7 @@ def test_entity_chunk_membership_cap_accepts_zero_and_rejects_negative(tmp_path)
 
 def test_entity_chunk_memberships_can_return_lightweight_graph_snippets(tmp_path):
     db, investigation_id = make_database(tmp_path)
-    extract_entities(db, investigation_id, ["person", "organization"], model=FakeGLiNER())
+    extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
     alice = next(row for row in db.list_entities(investigation_id) if row["name"] == "Alice")
 
     rows = db.list_entity_chunk_memberships(
@@ -363,3 +379,193 @@ def test_entity_chunk_memberships_can_return_lightweight_graph_snippets(tmp_path
     assert rows[0]["chunk_snippet"] == "Alice works for ACME."
     assert "chunk_text" not in rows[0].keys()
     assert "display_markdown" not in rows[0].keys()
+
+
+def test_parses_simple_lines_aliases_and_deduplicates():
+    output = """
+    - Veiligheidsregio Twente [Organization]
+    Afdeling Crisisbeheersing [Afdeling]
+    Enschede [Location]
+    burgemeester [Functie]
+    Jan de Vries [Person]
+    jan de vries [persoon]
+    """
+
+    entities = parse_entity_output(output, ["organization", "department", "location", "position", "person"])
+
+    assert [(entity.name, entity.entity_type) for entity in entities] == [
+        ("Veiligheidsregio Twente", "organization"),
+        ("Afdeling Crisisbeheersing", "department"),
+        ("Enschede", "location"),
+        ("burgemeester", "position"),
+        ("Jan de Vries", "person"),
+    ]
+
+
+def test_rejects_explanatory_model_output():
+    with pytest.raises(EntityOutputMalformed, match="unsupported output"):
+        parse_entity_output(
+            "Hier zijn de entiteiten:\nEnschede [Location]",
+            ["location"],
+        )
+
+
+def test_localization_uses_boundaries_and_flexible_dutch_surface_forms():
+    chunk = EntityChunk(
+        id="chunk",
+        file_id=1,
+        chunk_index=0,
+        text="Jansen sprak met Jan de\nVries bij Veiligheidsregio–Twente.",
+        path="doc.txt",
+        source_type="txt",
+    )
+    document = EntityDocument(file_id=1, path="doc.txt", chunks=(chunk,))
+
+    mentions, unmatched = locate_entity_mentions(
+        document,
+        [
+            ParsedEntity("Jan", "person"),
+            ParsedEntity("Jan de Vries", "person"),
+            ParsedEntity("Veiligheidsregio-Twente", "organization"),
+        ],
+    )
+
+    assert unmatched == []
+    assert [mention["mention_text"] for mention in mentions] == [
+        "Jan",
+        "Jan de\nVries",
+        "Veiligheidsregio–Twente",
+    ]
+
+
+def test_stitches_exact_chunk_overlap_once():
+    first = EntityChunk("a", 1, 0, "Alpha " + "x" * 30, "doc", "txt")
+    second = EntityChunk("b", 1, 1, "x" * 30 + " Omega", "doc", "txt")
+
+    assert stitch_chunk_texts((first, second)) == "Alpha " + "x" * 30 + "\n\nOmega"
+
+
+def test_whole_document_result_is_cached(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+    first_generator = FakeEntityGenerator()
+
+    extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=first_generator,
+    )
+    second_generator = FakeEntityGenerator()
+    extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=second_generator,
+    )
+
+    assert len(first_generator.prompts) == 1
+    assert "Alice works for ACME." in first_generator.prompts[0]
+    assert "Alice returned." in first_generator.prompts[0]
+    assert second_generator.prompts == []
+
+
+def test_failed_reextraction_preserves_previous_mentions(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+    extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=FakeEntityGenerator(),
+    )
+
+    class MalformedGenerator:
+        def generate(self, prompt):
+            return "I found Alice."
+
+    with pytest.raises(EntityOutputMalformed):
+        extract_entities(
+            db,
+            investigation_id,
+            ["person", "organization"],
+            generator=MalformedGenerator(),
+            model_name="different-model",
+        )
+
+    assert [(row["name"], row["mention_count"]) for row in db.list_entities(investigation_id)] == [
+        ("ACME", 1),
+        ("Alice", 2),
+    ]
+
+
+def test_truncated_whole_document_retries_as_larger_windows(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+
+    class TruncatingGenerator:
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, prompt):
+            self.prompts.append(prompt)
+            if "Alice works for ACME." in prompt and "Alice returned." in prompt:
+                return OllamaGeneration("Alice [Person]", done_reason="length")
+            return FakeEntityGenerator().generate(prompt)
+
+    generator = TruncatingGenerator()
+    count = extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=generator,
+        model_name="truncation-test",
+    )
+
+    assert count == 3
+    assert len(generator.prompts) == 3
+
+
+def test_unmatched_model_entities_are_discarded_and_reported(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+    notices = []
+
+    class HallucinatingGenerator:
+        def generate(self, prompt):
+            return "Alice [Person]\nNiet In Dit Document [Organization]"
+
+    count = extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=HallucinatingGenerator(),
+        model_name="hallucination-test",
+        notice=notices.append,
+    )
+
+    assert count == 2
+    assert [row["name"] for row in db.list_entities(investigation_id)] == ["Alice"]
+    assert len(notices) == 1
+    assert notices[0].startswith("Discarded 1 unmatched model entity:")
+
+
+def test_cancelled_extraction_preserves_previous_results(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+    extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=FakeEntityGenerator(),
+    )
+
+    with pytest.raises(EntityExtractionCancelled):
+        extract_entities(
+            db,
+            investigation_id,
+            ["person", "organization"],
+            generator=FakeEntityGenerator(),
+            model_name="cancel-test",
+            cancelled=lambda: True,
+        )
+
+    assert [(row["name"], row["mention_count"]) for row in db.list_entities(investigation_id)] == [
+        ("ACME", 1),
+        ("Alice", 2),
+    ]

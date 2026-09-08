@@ -10,6 +10,14 @@ class OllamaError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class OllamaGeneration:
+    response: str
+    done_reason: str = ""
+    prompt_eval_count: int = 0
+    eval_count: int = 0
+
+
 @dataclass
 class OllamaClient:
     base_url: str
@@ -109,12 +117,27 @@ class OllamaClient:
         return payload
 
     def generate(self, model: str, prompt: str) -> str:
+        return self.generate_detailed(model, prompt).response
+
+    def generate_detailed(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        options: dict[str, Any] | None = None,
+        think: bool | None = None,
+    ) -> OllamaGeneration:
         if not model:
             raise OllamaError("OLLAMA_LLM_MODEL is not configured.")
 
         request_json: dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
+        generation_options = dict(options or {})
         if self.num_ctx:
-            request_json["options"] = {"num_ctx": self.num_ctx}
+            generation_options["num_ctx"] = self.num_ctx
+        if generation_options:
+            request_json["options"] = generation_options
+        if think is not None:
+            request_json["think"] = think
 
         try:
             response = self._request(
@@ -128,7 +151,12 @@ class OllamaClient:
             raise
         except Exception as exc:
             raise OllamaError(f"Could not reach local Ollama generation endpoint: {exc}") from exc
-        return str(payload.get("response", "")).strip()
+        return OllamaGeneration(
+            response=str(payload.get("response", "")).strip(),
+            done_reason=str(payload.get("done_reason", "") or ""),
+            prompt_eval_count=int(payload.get("prompt_eval_count", 0) or 0),
+            eval_count=int(payload.get("eval_count", 0) or 0),
+        )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:

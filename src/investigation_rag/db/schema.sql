@@ -194,3 +194,13 @@ CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity
   ON entity_mentions(entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_mentions_file
   ON entity_mentions(file_id);
+
+CREATE TABLE IF NOT EXISTS entity_extraction_cache (
+  document_text_hash TEXT NOT NULL,
+  extraction_signature TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  raw_output TEXT NOT NULL,
+  parsed_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(document_text_hash, extraction_signature)
+);
