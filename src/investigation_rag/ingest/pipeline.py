@@ -99,6 +99,7 @@ class ScanPipeline:
             overlap_chars=config.chunk_overlap_chars,
             pdf_soft_min_chars=config.pdf_chunk_soft_min_chars,
             pdf_overlap_mode=config.pdf_chunk_overlap_mode,
+            max_tokens=config.chunk_max_tokens,
         )
         self.extraction_cache = ExtractionCache(db)
         self._timings: dict[str, float] = {}
@@ -950,6 +951,8 @@ class ScanPipeline:
                 filename=path.name,
                 size_bytes=scanned.size,
                 modified_ns=scanned.modified_ns,
+                source_content_hash=content_hash,
+                file_id=file_id,
             )
             records.append(
                 {

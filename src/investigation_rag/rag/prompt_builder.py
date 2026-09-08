@@ -182,6 +182,8 @@ def format_retrieved_context(results: list[SearchResult]) -> str:
             metadata.append(f"Date: {result.email_date}")
         if result.attachment_name:
             metadata.append(f"Attachment: {result.attachment_name}")
+        if (result.metadata or {}).get("heading_path_text"):
+            metadata.append(f"Section: {result.metadata['heading_path_text']}")
         metadata_text = "\n".join(metadata)
         header = citation_label(index, result)
         context_blocks.append(
@@ -269,6 +271,8 @@ def format_ledger_chunk(index: int, result: SearchResult) -> str:
         metadata.append(f"Date: {result.email_date}")
     if result.attachment_name:
         metadata.append(f"Attachment: {result.attachment_name}")
+    if (result.metadata or {}).get("heading_path_text"):
+        metadata.append(f"Section: {result.metadata['heading_path_text']}")
     return "\n".join(metadata) + f"\n\nRaw chunk text:\n{result.chunk_text}"
 
 

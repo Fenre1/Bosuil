@@ -107,7 +107,7 @@ class FilesPanel(QWidget):
         self.tree.itemSelectionChanged.connect(self.update_preview)
         self.tree.itemExpanded.connect(self.load_file_chunks)
 
-        self.preview = ChunkPreview()
+        self.preview = ChunkPreview(db=db)
         self.preview.previous_requested.connect(lambda: self.select_adjacent_chunk(-1))
         self.preview.next_requested.connect(lambda: self.select_adjacent_chunk(1))
 

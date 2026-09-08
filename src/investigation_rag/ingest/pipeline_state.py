@@ -9,7 +9,7 @@ from investigation_rag.extractors import get_extractor_version_for_suffix
 
 
 METADATA_FTS_SIGNATURE = "chunk-metadata-fts-v2"
-EMBEDDING_INPUT_SIGNATURE = "embedding-input-stable-v2"
+EMBEDDING_INPUT_SIGNATURE = "embedding-input-source-v3"
 
 
 @dataclass(frozen=True)
@@ -40,12 +40,15 @@ def pipeline_signatures(
         "target_chars": chunker.target_chars,
         "max_chars": chunker.max_chars,
         "overlap_chars": chunker.overlap_chars,
+        "max_tokens": chunker.max_tokens,
     }
     if source_type == "pdf":
         chunking_payload["pdf"] = {
             "soft_min_chars": chunker.pdf_config.soft_min_chars,
             "overlap_mode": chunker.pdf_config.overlap_mode,
         }
+    if source_type == "msg":
+        chunking_payload["attachment_algorithms"] = [chunker.version, chunker.pdf_version]
 
     return PipelineSignatures(
         extraction=get_extractor_version_for_suffix(suffix),

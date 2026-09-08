@@ -116,7 +116,27 @@ Supported extractors:
 - `.pdf`: PyMuPDF selectable text, page-aware.
 - `.msg`: `extract-msg`, including subject, sender, recipients, date, body, and supported attachments. Nested messages are depth-limited.
 
-Chunking is deterministic and versioned (`deterministic-v1`). There is no OCR and no AI/smart chunking in v1.
+Chunking is deterministic and structure-aware (`structured-v2`, `pdf-layout-v5-source`). Extracted paragraphs, headings, list items and table rows retain source locations. Chunks keep related blocks together and split oversized passages at sentence or word boundaries. PDFs retain page coordinates, use column-aware reading order, and suppress recurring page furniture. Font-span counts are not treated as evidence of a table.
+
+The stored passage contains source text. Document metadata, section headings, table-header context and bounded overlap are composed separately for embeddings. The default target is 2,800 characters; the complete embedding input is limited to 4,800 characters and an estimated 1,400 tokens. `RAG_CHUNK_MAX_TOKENS` uses a conservative UTF-8-bytes/3 estimate, not the model's tokenizer. Ollama requests disable truncation, so a model-specific context overflow is reported instead of silently dropping evidence. Embeddings require an Ollama version with `/api/embed` support.
+
+There is no OCR or image understanding. Scanned documents should be processed with separate tools before ingestion.
+
+### Viewing passages
+
+The file browser, search results and answer citations share three preview modes:
+
+- **Source** renders the original PDF page with highlighted passage regions, page navigation, zoom and a Show passage action. For DOCX and MSG it shows extracted document structure, supported inline formatting, lists and tables with the passage highlighted. TXT preserves whitespace and shows source line numbers. DOCX rendering does not reproduce Word's exact pagination or every layout feature.
+- **Readable text** shows the indexed passage, including its supported formatting, without embedding-only context.
+- **Embedding input** shows the complete text composed for the embedding model, including metadata and overlap.
+
+Earlier/Later passage navigation stays within the same document or attachment. Search-result and citation navigation remain separate. Attachments, including nested messages, are addressed through their parent message and attachment indexes rather than deleted temporary extraction paths.
+
+Source rendering runs in a separate process with bounded page/document caches. It verifies the source content hash before applying highlights. If the file changed, disappeared, or has no source references yet, the indexed text remains available and the preview explains why source highlighting is unavailable. Email rendering loads no external images, URLs or active HTML.
+
+### Updating existing investigations
+
+Run **Fast rescan** after updating. Stage signatures detect the new extraction and chunking versions, regenerate source references, and refresh affected embeddings. PDF chunking changes also invalidate email files containing PDF attachments. Existing chunks remain readable before the rescan; display-only viewer changes do not require new embeddings. The older pre-staged-schema investigation limitation described above still applies.
 
 ## Tests
 
@@ -124,4 +144,4 @@ Chunking is deterministic and versioned (`deterministic-v1`). There is no OCR an
 pytest
 ```
 
-The tests cover hashing, chunking, manifest change decisions, disappeared-file review behavior, and strict prompt construction.
+The tests cover hashing, chunking, manifest change decisions, disappeared-file review behavior, strict prompt construction, source alignment, full embedding-input budgets, attachment boundaries, and PDF highlight placement on rotated/cropped pages. PDF regressions also use files in `test_docs` when that directory is available. These tests do not require a running Ollama server.

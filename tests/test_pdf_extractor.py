@@ -128,6 +128,11 @@ def test_extract_pdf_layout_blocks_prefers_word_boundaries_when_spans_are_collap
     assert markdown == "For concreteness, we will"
 
 
+def test_pdf_word_recovery_never_substitutes_an_unrelated_line():
+    from investigation_rag.extractors.pdf_extractor import _best_line_text
+    assert _best_line_text("Floris Gisolf", "and Marcel Worring1") == "Floris Gisolf"
+
+
 def test_pdf_layout_to_markdown_leaves_long_sentences_as_text():
     layout = {
         "blocks": [

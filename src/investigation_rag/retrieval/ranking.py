@@ -49,6 +49,9 @@ def row_to_result(row: Any, score: float = 0.0) -> SearchResult:
                 metadata = loaded
         except json.JSONDecodeError:
             metadata = {}
+    metadata.setdefault("file_id", int(row["file_id"]))
+    if _optional_row_value(row, "content_hash"):
+        metadata.setdefault("source_content_hash", row["content_hash"])
     return SearchResult(
         chunk_id=str(row["id"]),
         investigation_id=int(row["investigation_id"]),
@@ -81,6 +84,9 @@ def _optional_row_value(row: Any, key: str) -> Any:
 
 def result_location_label(result: SearchResult) -> str:
     metadata = result.metadata or {}
+    if metadata.get("line_start"):
+        first, last = metadata["line_start"], metadata.get("line_end", metadata["line_start"])
+        return f"line {first}" if first == last else f"lines {first}-{last}"
     page_start = _optional_int(metadata.get("page_start"))
     page_end = _optional_int(metadata.get("page_end"))
     pages = metadata.get("pages")

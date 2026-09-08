@@ -44,8 +44,8 @@ def test_pdf_chunking_removes_recurring_headers_and_allows_page_spans():
     assert chunks[0].metadata["page_end"] == 3
     assert chunks[0].metadata["pages"] == [1, 2, 3]
     assert chunks[0].metadata["heading_path_text"] == "1 Risk Management"
-    assert chunks[0].metadata["source_spans"][0]["char_start"] >= chunks[0].metadata["retrieval_prefix_char_count"]
-    assert chunks[0].display_markdown.startswith("Operational risk depends")
+    assert chunks[0].metadata["source_spans"][0]["char_start"] == 0
+    assert chunks[0].display_markdown.startswith("### 1 Risk Management")
     assert "Annual Report 2025 | Page" not in chunks[0].display_markdown
 
 
@@ -70,10 +70,11 @@ def test_pdf_headings_prevent_cross_section_packing():
     assert len(chunks) == 2
     assert chunks[0].metadata["heading_path_text"] == "1 Risk Management"
     assert chunks[1].metadata["heading_path_text"] == "2 Findings"
-    assert "Section: 1 Risk Management" in chunks[0].text
-    assert "Section: 2 Findings" in chunks[1].text
-    assert chunks[0].display_markdown.startswith("The first section")
-    assert chunks[1].display_markdown.startswith("The second section")
+    assert "Section: 1 Risk Management" in chunks[0].metadata["embedding_context"]
+    assert "Section: 2 Findings" in chunks[1].metadata["embedding_context"]
+    assert "Section:" not in chunks[0].text
+    assert chunks[0].display_markdown.startswith("### 1 Risk Management")
+    assert chunks[1].display_markdown.startswith("### 2 Findings")
 
 
 def test_pdf_display_markdown_formats_lists_and_tables():
@@ -96,6 +97,7 @@ def test_pdf_display_markdown_formats_lists_and_tables():
 
     assert len(chunks) == 2
     assert chunks[0].display_markdown == (
+        "### 1 Findings\n\n"
         "The review found:\n\n"
         "- Missing approval\n"
         "- Late escalation"
@@ -236,8 +238,8 @@ def test_pdf_chunker_version_changes_only_for_pdf_settings():
     default = DeterministicChunker()
     changed = DeterministicChunker(pdf_soft_min_chars=1400, pdf_overlap_mode="paragraph")
 
-    assert default.version_for_source_type("txt") == "deterministic-v1"
-    assert changed.version_for_source_type("txt") == "deterministic-v1"
+    assert default.version_for_source_type("txt") == "structured-v2"
+    assert changed.version_for_source_type("txt") == "structured-v2"
     assert default.version_for_source_type("pdf") != changed.version_for_source_type("pdf")
     assert "soft_min=1400" in changed.version_for_source_type("pdf")
     assert "overlap=paragraph" in changed.version_for_source_type("pdf")

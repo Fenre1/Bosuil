@@ -65,6 +65,7 @@ class AppConfig:
     scan_discovery_workers: int = 4
     scan_hash_workers: int = 2
     scan_verbose_file_limit: int = 100
+    chunk_max_tokens: int = 1400
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -108,6 +109,7 @@ class AppConfig:
             scan_discovery_workers=_positive_int_env("SCAN_DISCOVERY_WORKERS", 4),
             scan_hash_workers=_positive_int_env("SCAN_HASH_WORKERS", 2),
             scan_verbose_file_limit=_positive_int_env("SCAN_VERBOSE_FILE_LIMIT", 100),
+            chunk_max_tokens=_positive_int_env("RAG_CHUNK_MAX_TOKENS", 1400),
         )
 
     def ensure_dirs(self) -> None:

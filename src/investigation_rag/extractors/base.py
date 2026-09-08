@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from investigation_rag.extractors.structure import SourceBlock
 
 
-EXTRACTOR_VERSION = "extractors-v5"
+EXTRACTOR_VERSION = "extractors-v6-source-blocks"
 
 
 @dataclass
@@ -15,6 +16,7 @@ class ExtractedSection:
     page_number: int | None = None
     display_markdown: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    blocks: list[SourceBlock] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -23,6 +25,7 @@ class ExtractedSection:
             "page_number": self.page_number,
             "display_markdown": self.display_markdown,
             "metadata": self.metadata,
+            "blocks": [block.to_dict() for block in self.blocks],
         }
 
     @classmethod
@@ -33,6 +36,7 @@ class ExtractedSection:
             page_number=payload.get("page_number"),
             display_markdown=payload.get("display_markdown"),
             metadata=payload.get("metadata", {}),
+            blocks=[SourceBlock.from_dict(item) for item in payload.get("blocks", [])],
         )
 
 

@@ -174,7 +174,8 @@ class SearchPanel(QWidget):
         self.metadata_view = QTextEdit()
         self.metadata_view.setReadOnly(True)
         self.metadata_view.setPlaceholderText("Select a result to view metadata")
-        self.preview = ChunkPreview("Select a result to preview matching text")
+        self.preview = ChunkPreview("Select a result to preview matching text", db=db, navigation_label="result")
+        self.preview.rendered.connect(lambda: self.highlight_preview_keywords(self.query_edit.text()))
         self.preview.previous_requested.connect(lambda: self.select_adjacent_result(-1))
         self.preview.next_requested.connect(lambda: self.select_adjacent_result(1))
 
@@ -1017,6 +1018,14 @@ def metadata_keys_for_type(source_type: str) -> list[str]:
 
 def hidden_metadata_keys() -> set[str]:
     return {
+        "display_html",
+        "embedding_context",
+        "source_content_hash",
+        "source_reference_version",
+        "source_document_id",
+        "source_section",
+        "file_id",
+        "attachment_chain",
         "heading_path",
         "source_spans",
         "retrieval_prefix",

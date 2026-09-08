@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from investigation_rag.extractors.base import BaseExtractor, ExtractedDocument, ExtractedSection
+from investigation_rag.extractors.structure import SourceBlock, html_blocks, text_blocks
 
 
 class MsgExtractor(BaseExtractor):
@@ -43,14 +44,19 @@ class MsgExtractor(BaseExtractor):
             html_body = _safe_html_body(msg)
             display_body = html_to_markdown(html_body) if html_body else body
             searchable_body = body or markdown_to_plain_text(display_body)
+            body_blocks = html_blocks(html_body) if html_body else []
+            if not body_blocks:
+                body_blocks = text_blocks(searchable_body, "body", kind="pre")
+            source_blocks = [SourceBlock("message-header", "\n".join(header), "message_header"), *body_blocks]
             display_markdown = "\n".join(_message_header_markdown(metadata))
             if display_body:
                 display_markdown = f"{display_markdown}\n\n{display_body.strip()}"
             section = ExtractedSection(
-                text="\n".join([*header, "", searchable_body]).strip(),
+                text="\n\n".join(block.text for block in source_blocks),
                 source_type=self.source_type,
                 display_markdown=display_markdown,
                 metadata=metadata,
+                blocks=source_blocks,
             )
             attachments = self._extract_attachments(msg, metadata)
             return ExtractedDocument(
@@ -68,7 +74,7 @@ class MsgExtractor(BaseExtractor):
         if self.depth >= self.max_depth:
             return []
         attachments: list[ExtractedDocument] = []
-        for attachment in getattr(msg, "attachments", []) or []:
+        for attachment_index, attachment in enumerate(getattr(msg, "attachments", []) or []):
             name = (
                 _safe_str(getattr(attachment, "longFilename", ""))
                 or _safe_str(getattr(attachment, "shortFilename", ""))
@@ -81,8 +87,10 @@ class MsgExtractor(BaseExtractor):
             if not data:
                 continue
             try:
+                if not isinstance(data, bytes):
+                    data = data.exportBytes()
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_path = Path(temp_dir) / name
+                    temp_path = Path(temp_dir) / Path(name).name
                     temp_path.write_bytes(data)
                     document = self._extract_supported_attachment(temp_path, suffix)
                     document.metadata.update(
@@ -92,6 +100,7 @@ class MsgExtractor(BaseExtractor):
                             "parent_email_sender": parent_metadata.get("sender", ""),
                         }
                     )
+                    _set_attachment_chain(document, {"index": attachment_index, "name": name})
                     for section in document.sections:
                         section.metadata.update(document.metadata)
                     attachments.append(document)
@@ -128,6 +137,15 @@ class MsgExtractor(BaseExtractor):
         if suffix == ".msg":
             return MsgExtractor(depth=self.depth + 1, max_depth=self.max_depth).extract(temp_path)
         raise ValueError(f"Unsupported attachment suffix: {suffix}")
+
+
+def _set_attachment_chain(document: ExtractedDocument, parent: dict[str, Any]) -> None:
+    chain = [parent, *document.metadata.get("attachment_chain", [])]
+    document.metadata["attachment_chain"] = chain
+    for section in document.sections:
+        section.metadata["attachment_chain"] = chain
+    for child in document.attachments:
+        _set_attachment_chain(child, parent)
 
 
 def _safe_str(value: Any) -> str:

@@ -185,6 +185,7 @@ def test_embed_passes_num_ctx_when_configured(monkeypatch):
                 "json": {
                     "model": "qwen",
                     "input": ["text"],
+                    "truncate": False,
                     "options": {"num_ctx": 16384},
                 }
             },

@@ -341,7 +341,7 @@ class RagPanel(QWidget):
         self.citation_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.citation_table.itemSelectionChanged.connect(self.update_chunk_preview)
 
-        self.chunk_preview = ChunkPreview("Select a citation to preview the source text")
+        self.chunk_preview = ChunkPreview("Select a citation to preview the source text", db=db, navigation_label="citation")
         self.chunk_preview.previous_requested.connect(lambda: self.select_adjacent_citation(-1))
         self.chunk_preview.next_requested.connect(lambda: self.select_adjacent_citation(1))
 

@@ -22,7 +22,7 @@ def test_chunking_preserves_page_metadata():
     assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
 
 
-def test_chunking_carries_matching_display_markdown():
+def test_legacy_extraction_uses_source_text_when_no_formatting_mapping_exists():
     document = ExtractedDocument(
         source_type="docx",
         sections=[
@@ -39,10 +39,11 @@ def test_chunking_carries_matching_display_markdown():
 
     assert len(chunks) == 1
     assert chunks[0].text == "Heading\n\nFirst paragraph."
-    assert chunks[0].display_markdown == "# Heading\n\nFirst paragraph."
+    assert chunks[0].metadata["display_html"] == "<p>Heading</p><p>First paragraph.</p>"
+    assert chunks[0].display_markdown is None
 
 
-def test_chunking_fuzzily_packs_display_markdown_when_paragraphs_differ():
+def test_chunking_never_guesses_formatted_passages_from_lengths():
     document = ExtractedDocument(
         source_type="pdf",
         sections=[
@@ -58,5 +59,6 @@ def test_chunking_fuzzily_packs_display_markdown_when_paragraphs_differ():
     chunks = chunker.chunk_document(document)
 
     assert len(chunks) == 2
-    assert chunks[0].display_markdown == "Intro paragraph."
-    assert chunks[1].display_markdown == "### Heading\n\nDetails about the heading. More details follow."
+    assert chunks[0].metadata["display_html"] == "<p>Intro paragraph.</p>"
+    assert "Intro paragraph" not in chunks[1].metadata["display_html"]
+    assert "Heading<br>Details about the heading." in chunks[1].metadata["display_html"]

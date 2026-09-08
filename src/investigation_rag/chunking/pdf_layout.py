@@ -4,19 +4,21 @@ import re
 import statistics
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from investigation_rag.chunking.base import Chunk
 from investigation_rag.extractors.base import ExtractedDocument
+from investigation_rag.extractors.structure import split_ranges
+from investigation_rag.chunking.structured import slice_spans
 
 
-PDF_CHUNKER_ALGORITHM_VERSION = "pdf-layout-v4"
+PDF_CHUNKER_ALGORITHM_VERSION = "pdf-layout-v5-source"
 PDF_HEADER_FOOTER_POLICY_VERSION = "pdf-furniture-v1"
-PDF_HEADING_POLICY_VERSION = "pdf-headings-v1"
-PDF_TABLE_POLICY_VERSION = "pdf-tables-v1"
+PDF_HEADING_POLICY_VERSION = "pdf-headings-v2"
+PDF_TABLE_POLICY_VERSION = "pdf-tables-v2"
 PDF_FIGURE_POLICY_VERSION = "pdf-figures-v1"
-PDF_DISPLAY_POLICY_VERSION = "pdf-display-v1"
+PDF_DISPLAY_POLICY_VERSION = "pdf-display-v2"
 DEFAULT_PDF_SOFT_MIN_CHARS = 1200
 DEFAULT_PDF_OVERLAP_MODE = "sentence"
 
@@ -233,7 +235,7 @@ def chunk_pdf_document(document: ExtractedDocument, config: PdfChunkingConfig) -
     figure_debug = mark_figure_regions(body_blocks, body_size)
     heading_debug = classify_headings(body_blocks, body_size)
     units, unit_debug = build_logical_units(body_blocks, body_size)
-    units = split_oversized_units(units, config.max_chars)
+    units = split_oversized_units(units, config.target_chars)
     drafts = pack_logical_units(units, config)
     chunks = drafts_to_chunks(drafts, document.metadata, config, furniture_debug, figure_debug, heading_debug, unit_debug)
     return chunks
@@ -257,11 +259,38 @@ def collect_layout_blocks(document: ExtractedDocument) -> list[PdfLayoutBlock]:
     ordered: list[PdfLayoutBlock] = []
     for page_number in sorted(grouped):
         page_blocks = grouped[page_number]
-        if _should_use_visual_page_order(page_blocks):
+        column_order = _column_page_order(page_blocks)
+        if column_order is not None:
+            ordered.extend(column_order)
+        elif _should_use_visual_page_order(page_blocks):
             ordered.extend(sorted(page_blocks, key=_visual_block_key))
         else:
             ordered.extend(sorted(page_blocks, key=lambda item: (item.reading_order, item.y0_rel, item.x0_rel)))
     return ordered
+
+
+def _column_page_order(blocks: list[PdfLayoutBlock]) -> list[PdfLayoutBlock] | None:
+    # Require repeated, column-width lines on both sides of a real gutter.
+    # Full-width headings/captions divide the page into independent bands.
+    left = [b for b in blocks if b.x0_rel < .30 and .32 < b.x1_rel < .52 and len(b.text) > 30]
+    right = [b for b in blocks if .48 < b.x0_rel < .67 and b.x1_rel > .72 and len(b.text) > 30]
+    if min(len(left), len(right)) < 6:
+        return None
+    gutter = (statistics.median(b.x1_rel for b in left) + statistics.median(b.x0_rel for b in right)) / 2
+    spanning = [b for b in blocks if b.x0_rel < gutter - .03 and b.x1_rel > gutter + .03]
+    remaining = [b for b in blocks if b not in spanning]
+    output = []
+
+    def band(items: list[PdfLayoutBlock]) -> list[PdfLayoutBlock]:
+        return sorted(items, key=lambda b: (b.x_center_rel >= gutter, b.y0_rel, b.x0_rel, b.reading_order))
+
+    for divider in sorted(spanning, key=_visual_block_key):
+        before = [b for b in remaining if b.y0_rel < divider.y0_rel]
+        output.extend(band(before))
+        output.append(divider)
+        remaining = [b for b in remaining if b.y0_rel >= divider.y0_rel]
+    output.extend(band(remaining))
+    return output
 
 
 def _visual_block_key(block: PdfLayoutBlock) -> tuple[float, float, int]:
@@ -496,11 +525,24 @@ def build_logical_units(blocks: list[PdfLayoutBlock], body_size: float) -> tuple
 
     for block in blocks:
         if block.is_heading:
+            if (current_blocks and all(item.is_heading for item in current_blocks)
+                    and current_blocks[-1].page_number == block.page_number
+                    and current_blocks[-1].heading_level == block.heading_level
+                    and abs(current_blocks[-1].font_size - block.font_size) < .5
+                    and abs(current_blocks[-1].x0_rel - block.x0_rel) < .02
+                    and 0 <= block.y0_rel - current_blocks[-1].y1_rel <= .015):
+                current_blocks.append(block)
+                heading_stack[-1] = (heading_stack[-1][0], " ".join(item.text for item in current_blocks))
+                current_heading_path = tuple(text for _, text in heading_stack)
+                continue
             flush("heading boundary")
             level = block.heading_level or 3
             while heading_stack and heading_stack[-1][0] >= level:
                 heading_stack.pop()
             heading_stack.append((level, _clean_unit_text(block.text)))
+            current_blocks = [block]
+            current_content_type = "heading"
+            current_heading_path = tuple(text for _, text in heading_stack)
             debug.append(
                 {
                     "event": "heading_path",
@@ -562,7 +604,6 @@ def pack_logical_units(units: list[LogicalUnit], config: PdfChunkingConfig) -> l
     if not units:
         return []
 
-    section_lengths = _section_lengths(units)
     drafts: list[PdfChunkDraft] = []
     current = PdfChunkDraft()
 
@@ -589,17 +630,13 @@ def pack_logical_units(units: list[LogicalUnit], config: PdfChunkingConfig) -> l
             continue
         projected_len = len(current.text) + len(unit.text) + 2
         current_heading = current.heading_path
-        strong_boundary = unit.heading_path != current_heading and not _is_weak_section_boundary(
-            current_heading,
-            unit.heading_path,
-            section_lengths,
-            config.soft_min_chars,
-        )
+        strong_boundary = unit.heading_path != current_heading
         if strong_boundary:
             flush("strong section boundary")
         elif projected_len > config.max_chars:
             flush("maximum character budget")
-        elif projected_len > config.target_chars and len(current.text) >= config.soft_min_chars:
+        elif (projected_len > config.target_chars and len(current.text) >= config.soft_min_chars
+              and not all(item.content_type == "heading" for item in current.units)):
             flush("target character budget")
 
         current.units.append(unit)
@@ -630,7 +667,6 @@ def drafts_to_chunks(
     unit_debug: dict[str, Any],
 ) -> list[Chunk]:
     section_counts: dict[str, int] = defaultdict(int)
-    document_title = _document_title(document_metadata)
     chunks: list[Chunk] = []
     for index, draft in enumerate(drafts):
         previous = drafts[index - 1] if index else None
@@ -653,12 +689,9 @@ def drafts_to_chunks(
         pages = draft.pages
         page_start = min(pages) if pages else None
         page_end = max(pages) if pages else None
-        prefix = _retrieval_prefix(document_title, heading_label)
-        overlap_prefix = f"Previous context: {draft.overlap_text}\n\n" if draft.overlap_text else ""
-        body_offset = len(prefix) + len(overlap_prefix)
-        text = f"{prefix}{overlap_prefix}{draft.text}".strip()
-        display_markdown = _chunk_display_markdown(document_title, draft)
-        source_spans = _offset_source_spans(draft.source_spans, body_offset)
+        text = draft.text
+        display_markdown = draft.display_text
+        source_spans = list(draft.source_spans)
         metadata = dict(document_metadata)
         metadata.update(
             {
@@ -682,8 +715,6 @@ def drafts_to_chunks(
                     else ""
                 ),
                 "source_spans": source_spans,
-                "retrieval_prefix": prefix,
-                "retrieval_prefix_char_count": len(prefix),
                 "overlap_text": draft.overlap_text,
                 "overlap_mode": config.overlap_mode,
                 "overlap_source_spans": list(draft.overlap_source_spans),
@@ -887,6 +918,8 @@ def _heading_level(
         return None, ""
     if text.casefold().startswith("arxiv:"):
         return None, ""
+    if text.casefold() in {"abstract", "keywords", "introduction", "methods", "methodology", "results", "discussion", "conclusion", "conclusions", "references", "acknowledgements", "acknowledgments"}:
+        return 2, "standalone section label"
     if text.endswith(":") and block.font_size < body_size * 1.18 and not block.bold:
         return None, ""
     if _looks_like_sentence(text) and block.font_size < body_size * 1.35:
@@ -904,6 +937,8 @@ def _heading_level(
         return 1, "large font relative to body"
     if block.font_size >= body_size * 1.35 and len(text) <= 130 and not _looks_like_sentence(text):
         return 2, "larger font relative to body"
+    if block.font_size >= body_size * 1.18 and len(text) <= 100 and not _looks_like_sentence(text):
+        return 3, "section font larger than body"
     if block.bold and len(text) <= 120 and _has_heading_spacing(block, previous_block, next_block, body_size):
         return 3, "bold text with heading spacing"
     if _is_centered(block) and len(text) <= 90 and not _looks_like_sentence(text) and _has_heading_spacing(block, previous_block, next_block, body_size):
@@ -926,7 +961,7 @@ def _classify_content_type(block: PdfLayoutBlock) -> str:
         return "list"
     if re.search(r"\.{4,}\s*\d{1,4}$", text):
         return "toc"
-    if _looks_like_table_row(text, block):
+    if _looks_like_table_row(block.text, block):
         return "table"
     return "body"
 
@@ -1172,6 +1207,8 @@ def _join_block_texts(blocks: list[PdfLayoutBlock], content_type: str) -> tuple[
             delimiter = ""
         elif output.endswith("-") and re.match(r"^[a-z]", text):
             output = output[:-1]
+            if spans:
+                spans[-1]["char_end"] = len(output)
             delimiter = ""
             debug.append(f"dehyphenated join before {block.block_id}")
         elif content_type in {"list", "table", "caption", "footnote", "figure", "toc"}:
@@ -1190,6 +1227,8 @@ def _join_block_texts(blocks: list[PdfLayoutBlock], content_type: str) -> tuple[
                 "rel_bbox": list(block.rel_bbox),
                 "char_start": start,
                 "char_end": len(output),
+                "block_start": 0,
+                "block_end": len(text),
             }
         )
     return output.strip(), spans, debug
@@ -1236,118 +1275,15 @@ def _merge_list_introductions(units: list[LogicalUnit]) -> list[LogicalUnit]:
 
 
 def _split_unit(unit: LogicalUnit, max_chars: int) -> list[LogicalUnit]:
-    if unit.content_type in {"table", "list", "figure"}:
-        return _split_unit_by_lines(unit, max_chars)
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", unit.text) if part.strip()]
-    if len(paragraphs) > 1:
-        return _split_by_text_parts(unit, paragraphs, "\n\n", "paragraph", max_chars)
-    sentences = _split_sentences(unit.text)
-    if len(sentences) > 1:
-        return _split_by_text_parts(unit, sentences, " ", "sentence", max_chars)
-    return _split_by_character_windows(unit, max_chars)
-
-
-def _split_unit_by_lines(unit: LogicalUnit, max_chars: int) -> list[LogicalUnit]:
-    lines = [line for line in unit.text.splitlines() if line.strip()]
-    if len(lines) <= 1:
-        return _split_by_character_windows(unit, max_chars)
-    header = lines[0] if unit.content_type == "table" else ""
-    chunks: list[str] = []
-    current: list[str] = []
-    for line in lines:
-        projected = len("\n".join(current + [line]))
-        if current and projected > max_chars:
-            chunks.append("\n".join(current))
-            current = [header, line] if header and line != header else [line]
-            continue
-        current.append(line)
-    if current:
-        chunks.append("\n".join(current))
-    return _split_by_text_parts(unit, chunks, "\n", f"{unit.content_type}-row", max_chars)
-
-
-def _split_by_text_parts(
-    unit: LogicalUnit,
-    parts: list[str],
-    delimiter: str,
-    rule: str,
-    max_chars: int,
-) -> list[LogicalUnit]:
-    output: list[LogicalUnit] = []
-    current: list[str] = []
-    current_len = 0
-    budget = max(max_chars, 1)
-    for part in parts:
-        if len(part) > budget:
-            if current:
-                output.append(_unit_slice(unit, delimiter.join(current), rule, len(output) > 0))
-                current = []
-                current_len = 0
-            output.extend(_split_by_character_windows(_unit_slice(unit, part, rule, len(output) > 0), budget))
-            continue
-        projected = current_len + len(part) + (len(delimiter) if current else 0)
-        if current and projected > budget:
-            output.append(_unit_slice(unit, delimiter.join(current), rule, len(output) > 0))
-            current = []
-            current_len = 0
-        current.append(part)
-        current_len += len(part) + (len(delimiter) if current_len else 0)
-    if current:
-        output.append(_unit_slice(unit, delimiter.join(current), rule, len(output) > 0))
-    return output
-
-
-def _split_by_character_windows(unit: LogicalUnit, max_chars: int) -> list[LogicalUnit]:
-    output: list[LogicalUnit] = []
-    start = 0
-    while start < len(unit.text):
-        end = min(start + max_chars, len(unit.text))
-        output.append(_unit_slice(unit, unit.text[start:end].strip(), "character", bool(output)))
-        if end == len(unit.text):
-            break
-        start = max(end, start + 1)
-    return output
-
-
-def _unit_slice(unit: LogicalUnit, text: str, rule: str, continuation: bool) -> LogicalUnit:
-    spans = _spans_for_text_slice(unit, text)
-    pages = tuple(sorted({int(span["page_number"]) for span in spans if "page_number" in span})) or unit.pages
-    return LogicalUnit(
-        text=text,
-        display_text=_display_text(text, unit.content_type),
-        pages=pages,
-        heading_path=unit.heading_path,
-        content_type=unit.content_type,
-        source_spans=tuple(spans),
-        debug=(*unit.debug, f"split by {rule}"),
-        contains_table=unit.contains_table,
-        contains_list=unit.contains_list,
-        contains_caption=unit.contains_caption,
-        contains_footnote=unit.contains_footnote,
-        contains_figure=unit.contains_figure,
-        is_structurally_meaningful=unit.is_structurally_meaningful,
-        is_continuation=continuation,
-        fallback_rule=rule,
-    )
-
-
-def _section_lengths(units: list[LogicalUnit]) -> dict[tuple[str, ...], int]:
-    lengths: dict[tuple[str, ...], int] = defaultdict(int)
-    for unit in units:
-        lengths[unit.heading_path] += len(unit.text)
-    return lengths
-
-
-def _is_weak_section_boundary(
-    current_heading: tuple[str, ...],
-    next_heading: tuple[str, ...],
-    section_lengths: dict[tuple[str, ...], int],
-    soft_min_chars: int,
-) -> bool:
-    if not current_heading or not next_heading:
-        return False
-    threshold = max(300, soft_min_chars // 2)
-    return section_lengths[current_heading] < threshold or section_lengths[next_heading] < threshold
+    result = []
+    for start, end in split_ranges(unit.text, max_chars):
+        spans = slice_spans(list(unit.source_spans), start, end)
+        text = unit.text[start:end]
+        result.append(replace(unit, text=text, display_text=_display_text(text, unit.content_type),
+                              source_spans=tuple(spans),
+                              pages=tuple(sorted({span["page_number"] for span in spans})),
+                              is_continuation=start > 0, fallback_rule="sentence-or-word"))
+    return result
 
 
 def _merge_soft_min_drafts(drafts: list[PdfChunkDraft], config: PdfChunkingConfig) -> list[PdfChunkDraft]:
@@ -1423,44 +1359,6 @@ def _structural_overlap(
     return candidate, tuple(spans)
 
 
-def _retrieval_prefix(document_title: str, heading_label: str) -> str:
-    lines = []
-    if document_title:
-        lines.append(f"Document: {document_title}")
-    if heading_label:
-        lines.append(f"Section: {heading_label}")
-    if not lines:
-        return ""
-    return "\n".join(lines) + "\n\n"
-
-
-def _chunk_display_markdown(document_title: str, draft: PdfChunkDraft) -> str | None:
-    parts: list[str] = []
-    if draft.overlap_text:
-        parts.append(_display_overlap_markdown(draft.overlap_text))
-    body = draft.display_text.strip()
-    if body:
-        parts.append(body)
-    markdown = "\n\n".join(part for part in parts if part).strip()
-    return markdown or None
-
-
-def _display_overlap_markdown(text: str) -> str:
-    escaped = _escape_markdown(_clean_unit_text(text))
-    return f"> Previous context: {escaped}"
-
-
-def _document_title(document_metadata: dict[str, Any]) -> str:
-    for key in ("title", "document_title"):
-        value = str(document_metadata.get(key, "")).strip()
-        if value:
-            return value
-    path = str(document_metadata.get("path", "")).strip()
-    if path:
-        return re.sub(r"\.[^.\\/]+$", "", path.replace("\\", "/").rsplit("/", 1)[-1])
-    return ""
-
-
 def _offset_source_spans(spans: Iterable[dict[str, Any]], offset: int) -> list[dict[str, Any]]:
     adjusted: list[dict[str, Any]] = []
     for span in spans:
@@ -1491,6 +1389,8 @@ def _isolated_content_type(draft: PdfChunkDraft) -> str:
 
 
 def _display_text(text: str, content_type: str) -> str:
+    if content_type == "heading":
+        return f"### {_escape_markdown(text)}"
     if content_type == "list":
         return _list_markdown(text)
     if content_type == "table":
@@ -1682,8 +1582,8 @@ def _looks_like_table_row(text: str, block: PdfLayoutBlock) -> bool:
         return True
     if re.search(r"\S\s{3,}\S", text):
         return True
-    if block.metadata.get("span_count", 1) and int(block.metadata.get("span_count", 1)) >= 4 and len(text.split()) >= 4:
-        return True
+    # PDF font spans are not table cells. Justified prose often has one span
+    # per word; using their count fragmented entire articles into tiny tables.
     return False
 
 

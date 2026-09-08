@@ -44,6 +44,8 @@ class NeighborContextExpander:
                 if len(packed) >= budget:
                     break
                 neighbor = row_to_result(row, score=result.score)
+                if not same_source_document(result, neighbor):
+                    continue
                 if neighbor.chunk_id in seen:
                     continue
                 packed.append(
@@ -61,3 +63,9 @@ class NeighborContextExpander:
                 seen.add(neighbor.chunk_id)
 
         return packed[:budget]
+
+
+def same_source_document(left: SearchResult, right: SearchResult) -> bool:
+    lm, rm = left.metadata or {}, right.metadata or {}
+    return (left.file_id == right.file_id
+            and lm.get("source_document_id", left.attachment_name or "root") == rm.get("source_document_id", right.attachment_name or "root"))

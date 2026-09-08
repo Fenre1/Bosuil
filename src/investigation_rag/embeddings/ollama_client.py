@@ -29,7 +29,7 @@ class OllamaClient:
         if not texts:
             return []
 
-        request_json: dict[str, Any] = {"model": model, "input": texts}
+        request_json: dict[str, Any] = {"model": model, "input": texts, "truncate": False}
         if self.num_ctx:
             request_json["options"] = {"num_ctx": self.num_ctx}
 
@@ -40,7 +40,7 @@ class OllamaClient:
                 json=request_json,
             )
             if response.status_code == 404:
-                return [self._embed_legacy(model, text) for text in texts]
+                raise OllamaError("This Ollama version lacks /api/embed. Update Ollama to enforce embedding context limits without truncating evidence.")
             response.raise_for_status()
             payload = response.json()
         except OllamaError:

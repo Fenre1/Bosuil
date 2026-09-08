@@ -9,7 +9,7 @@ from typing import Any
 from investigation_rag.extractors.base import BaseExtractor, EXTRACTOR_VERSION, ExtractedDocument, ExtractedSection
 
 
-PDF_LAYOUT_EXTRACTION_VERSION = "pdf-layout-blocks-v3"
+PDF_LAYOUT_EXTRACTION_VERSION = "pdf-layout-blocks-v4"
 
 
 class PdfExtractor(BaseExtractor):
@@ -231,7 +231,8 @@ def _best_line_text(span_text: str, word_text: str) -> str:
         return word_text
     if _looks_space_collapsed(span_text, word_text):
         return word_text
-    if word_text.count(" ") > span_text.count(" ") and len(word_text) >= len(span_text) * 0.75:
+    if (word_text.count(" ") > span_text.count(" ")
+            and re.sub(r"\s+", "", word_text) == re.sub(r"\s+", "", span_text)):
         return word_text
     return span_text
 
