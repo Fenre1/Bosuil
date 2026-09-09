@@ -112,6 +112,51 @@ def test_clear_invalidates_pending_source_result(qt_app):
     view.close()
 
 
+def test_workspace_switch_routes_all_preview_neighbors_to_active_database(qt_app, tmp_path):
+    from investigation_rag.config import AppConfig
+    from investigation_rag.gui.main_window import MainWindow
+    from investigation_rag.workspace import WorkspaceCatalog
+
+    catalog = WorkspaceCatalog(tmp_path / "data")
+    catalog.initialize()
+    workspaces = [catalog.create(name, []) for name in ("Alpha", "Beta")]
+    for workspace in workspaces:
+        with workspace.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO files (id, investigation_id, path, normalized_path,
+                   first_seen_at, last_seen_at, updated_at)
+                   VALUES (1, 1, 'evidence.txt', 'evidence.txt', '', '', '')"""
+            )
+            conn.execute(
+                """INSERT INTO chunks (id, investigation_id, file_id, content_hash,
+                   chunk_index, chunk_text, chunk_text_hash, source_type, path,
+                   extractor_version, chunker_version, created_at, updated_at)
+                   VALUES ('neighbor', 1, 1, 'hash', 1, ?, 'hash', 'txt',
+                           'evidence.txt', 'test', 'test', '', '')""",
+                (workspace.entry.name,),
+            )
+
+    config = AppConfig.from_env().for_workspace(tmp_path / "inactive")
+    window = MainWindow(config, catalog)
+    previews = (window.files_panel.preview, window.search_panel.preview,
+                window.rag_panel.chunk_preview)
+    try:
+        # The startup catalog deliberately has no chunks table. Each workspace
+        # reuses file/chunk IDs, so a stale connection could show another case.
+        for workspace in workspaces:
+            window._apply_workspace_dependencies(workspace)
+            for preview in previews:
+                preview.set_mode("embedding")
+                preview.set_chunk("Selected evidence", chunk_index=0,
+                                  metadata={"file_id": 1})
+                assert not preview.earlier_button.isEnabled()
+                assert preview.later_button.isEnabled()
+                preview.later_button.click()
+                assert preview.toPlainText() == workspace.entry.name
+    finally:
+        window.close()
+
+
 def test_source_page_navigation_can_leave_the_selected_passage(qt_app, tmp_path):
     import fitz
     from investigation_rag.gui.source_view import SourceView

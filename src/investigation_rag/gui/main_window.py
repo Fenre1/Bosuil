@@ -340,11 +340,14 @@ class MainWindow(QMainWindow):
         self.scan_panel.disappeared_panel.store = workspace.store
         self.folder_scope_panel.db = workspace.db
         self.files_panel.db = workspace.db
+        self.files_panel.preview.db = workspace.db
         self.search_panel.config = workspace_config
         self.search_panel.db = workspace.db
+        self.search_panel.preview.db = workspace.db
         self.search_panel.store = workspace.store
         self.rag_panel.config = workspace_config
         self.rag_panel.db = workspace.db
+        self.rag_panel.chunk_preview.db = workspace.db
         self.rag_panel.store = workspace.store
 
     def update_investigation_actions(self) -> None:
