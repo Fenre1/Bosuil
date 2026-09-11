@@ -1,4 +1,7 @@
 import json
+import shutil
+
+import pytest
 
 from investigation_rag.workspace import WORKSPACE_INVESTIGATION_ID, WorkspaceCatalog
 
@@ -38,3 +41,32 @@ def test_catalog_discovers_a_copied_workspace(tmp_path):
         (workspace.entry.workspace_path / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["id"] == workspace.entry.id
+
+
+def test_catalog_repairs_absolute_paths_after_data_directory_move(tmp_path):
+    original_dir = tmp_path / "original"
+    original = WorkspaceCatalog(original_dir)
+    original.initialize()
+    workspace = original.create("Moved case", [tmp_path / "unavailable-evidence"])
+
+    moved_dir = tmp_path / "moved"
+    shutil.copytree(original_dir, moved_dir)
+    moved = WorkspaceCatalog(moved_dir)
+    moved.initialize()
+
+    entry = moved.get(workspace.entry.id)
+    assert entry is not None
+    assert entry.workspace_path == (moved.workspaces_dir / workspace.entry.id).resolve()
+    assert moved.open(entry).db.get_investigation(WORKSPACE_INVESTIGATION_ID)["name"] == "Moved case"
+
+
+def test_open_does_not_silently_create_a_database_at_a_stale_path(tmp_path):
+    catalog = WorkspaceCatalog(tmp_path / "data")
+    catalog.initialize()
+    workspace = catalog.create("Case", [tmp_path / "evidence"])
+    workspace.db.path.unlink()
+
+    with pytest.raises(FileNotFoundError, match="Investigation database not found"):
+        catalog.open(workspace.entry)
+
+    assert not workspace.db.path.exists()

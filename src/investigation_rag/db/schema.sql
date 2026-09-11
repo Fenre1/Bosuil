@@ -161,3 +161,46 @@ CREATE TABLE IF NOT EXISTS disappeared_files (
 
 CREATE INDEX IF NOT EXISTS idx_disappeared_pending
   ON disappeared_files(investigation_id, status);
+
+CREATE TABLE IF NOT EXISTS entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  normalized_name TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  merged_into_id INTEGER REFERENCES entities(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(investigation_id, normalized_name, entity_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_active
+  ON entities(investigation_id, merged_into_id, entity_type, name);
+
+CREATE TABLE IF NOT EXISTS entity_mentions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  mention_text TEXT NOT NULL,
+  start_offset INTEGER NOT NULL,
+  end_offset INTEGER NOT NULL,
+  confidence REAL NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(chunk_id, start_offset, end_offset, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity
+  ON entity_mentions(entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_file
+  ON entity_mentions(file_id);
+
+CREATE TABLE IF NOT EXISTS entity_extraction_cache (
+  document_text_hash TEXT NOT NULL,
+  extraction_signature TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  raw_output TEXT NOT NULL,
+  parsed_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(document_text_hash, extraction_signature)
+);

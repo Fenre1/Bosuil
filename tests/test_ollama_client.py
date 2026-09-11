@@ -235,3 +235,53 @@ def test_generate_omits_num_ctx_when_unset(monkeypatch):
             "stream": False,
         }
     }
+
+
+def test_detailed_generation_preserves_completion_metadata_and_entity_options(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "response": "Enschede [Location]",
+                "done_reason": "stop",
+                "prompt_eval_count": 123,
+                "eval_count": 7,
+            }
+
+    class FakeSession:
+        latest = None
+
+        def __init__(self):
+            self.trust_env = True
+            self.calls = []
+            FakeSession.latest = self
+
+        def request(self, method, url, timeout, **kwargs):
+            self.calls.append((method, url, timeout, kwargs, self.trust_env))
+            return FakeResponse()
+
+    class FakeRequests:
+        Session = FakeSession
+
+    monkeypatch.setitem(sys.modules, "requests", FakeRequests)
+
+    result = OllamaClient("http://127.0.0.1:11434", num_ctx=131072).generate_detailed(
+        "qwen3.6",
+        "Extract",
+        options={"temperature": 0, "num_predict": 8192},
+        think=False,
+    )
+
+    assert result.response == "Enschede [Location]"
+    assert result.done_reason == "stop"
+    assert result.prompt_eval_count == 123
+    assert result.eval_count == 7
+    assert FakeSession.latest.calls[0][3]["json"] == {
+        "model": "qwen3.6",
+        "prompt": "Extract",
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 8192, "num_ctx": 131072},
+        "think": False,
+    }

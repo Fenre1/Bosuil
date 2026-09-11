@@ -9,6 +9,7 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -25,12 +26,21 @@ from investigation_rag.config import AppConfig
 from investigation_rag.db.lancedb_store import LanceDBStore
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.gui.file_type_scope import FileTypeScope, FileTypeScopePanel
+from investigation_rag.gui.evaluation_panel import EvaluationPanel
+from investigation_rag.gui.entities_panel import EntitiesPanel
+from investigation_rag.gui.fact_ledger_panel import FactLedgerPanel
 from investigation_rag.gui.files_panel import FilesPanel
 from investigation_rag.gui.folder_scope import FolderScope, FolderScopePanel
 from investigation_rag.gui.investigation_dialog import InvestigationDialog
 from investigation_rag.gui.rag_panel import RagPanel
 from investigation_rag.gui.scan_panel import ScanPanel
 from investigation_rag.gui.search_panel import SearchPanel
+from investigation_rag.portability import (
+    ARCHIVE_EXTENSION,
+    export_workspace,
+    import_workspace,
+    rebuild_workspace_vectors,
+)
 from investigation_rag.workspace import InvestigationWorkspace, WorkspaceCatalog
 
 LOGGER = logging.getLogger(__name__)
@@ -112,6 +122,15 @@ class MainWindow(QMainWindow):
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.setObjectName("GhostButton")
         self.refresh_button.clicked.connect(lambda: self.reload_investigations())
+        self.export_button = QPushButton("Export")
+        self.export_button.setObjectName("GhostButton")
+        self.export_button.clicked.connect(self.export_investigation)
+        self.import_button = QPushButton("Import")
+        self.import_button.setObjectName("GhostButton")
+        self.import_button.clicked.connect(self.import_investigation)
+        self.rebuild_vectors_button = QPushButton("Rebuild vectors")
+        self.rebuild_vectors_button.setObjectName("GhostButton")
+        self.rebuild_vectors_button.clicked.connect(self.rebuild_investigation_vectors)
 
         title = QLabel("Bosuil, de lokale antwoordvogel")
         title.setObjectName("AppTitle")
@@ -144,15 +163,21 @@ class MainWindow(QMainWindow):
         self.file_type_scope_panel = FileTypeScopePanel(self.file_type_scope)
         self.filters_panel = self.build_filters_panel()
         self.files_panel = FilesPanel(self.db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
+        self.entities_panel = EntitiesPanel(self.db, self.store, config)
+        self.fact_ledger_panel = FactLedgerPanel(config, self.db)
         self.files_panel.load_started.connect(self.on_investigation_data_load_started)
         self.files_panel.load_finished.connect(self.on_investigation_data_load_finished)
         self.search_panel = SearchPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
         self.rag_panel = RagPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
+        self.evaluation_panel = EvaluationPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
         self.tabs.addTab(self.scan_panel, "Onderzoeken")
         self.tabs.addTab(self.filters_panel, "Filters")
         self.tabs.addTab(self.files_panel, "Bestanden")
+        self.tabs.addTab(self.entities_panel, "Entiteiten")
+        self.tabs.addTab(self.fact_ledger_panel, "Feitenoverzicht")
         self.tabs.addTab(self.search_panel, "Zoeken")
         self.tabs.addTab(self.rag_panel, "De Uil Antwoord")
+        self.tabs.addTab(self.evaluation_panel, "Evaluatie")
 
         container = QWidget()
         container.setObjectName("AppRoot")
@@ -219,6 +244,12 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.edit_button)
         action_row.addWidget(self.load_button)
 
+        portability_row = QHBoxLayout()
+        portability_row.setSpacing(8)
+        portability_row.addWidget(self.import_button)
+        portability_row.addWidget(self.export_button)
+        portability_row.addWidget(self.rebuild_vectors_button)
+
         scan_row = QHBoxLayout()
         scan_row.setSpacing(8)
         scan_row.addWidget(self.scan_panel.scan_mode)
@@ -229,6 +260,7 @@ class MainWindow(QMainWindow):
         selector_layout.addWidget(self.investigation_list, 1)
         selector_layout.addWidget(self.loaded_investigation_label)
         selector_layout.addLayout(action_row)
+        selector_layout.addLayout(portability_row)
         selector_layout.addLayout(scan_row)
         return selector
 
@@ -243,6 +275,7 @@ class MainWindow(QMainWindow):
         return str(data) if data is not None else None
 
     def reload_investigations(self, select_id: str | None = None) -> None:
+        self.catalog.discover()
         current = select_id if select_id is not None else self.selected_workspace_id()
         loaded_id = self.active_workspace_id()
         seen_ids = set()
@@ -312,8 +345,11 @@ class MainWindow(QMainWindow):
             ("folder filter", self.folder_scope_panel),
             ("file-type filter", self.file_type_scope_panel),
             ("files panel kickoff", self.files_panel),
+            ("entities panel", self.entities_panel),
+            ("fact ledger panel", self.fact_ledger_panel),
             ("search panel", self.search_panel),
             ("RAG panel", self.rag_panel),
+            ("evaluation panel", self.evaluation_panel),
         ):
             phase_started = perf_counter()
             panel.set_investigation_id(investigation_id)
@@ -341,6 +377,8 @@ class MainWindow(QMainWindow):
         self.folder_scope_panel.db = workspace.db
         self.files_panel.db = workspace.db
         self.files_panel.preview.db = workspace.db
+        self.entities_panel.set_data_sources(workspace.db, workspace.store)
+        self.fact_ledger_panel.set_data_sources(workspace_config, workspace.db)
         self.search_panel.config = workspace_config
         self.search_panel.db = workspace.db
         self.search_panel.preview.db = workspace.db
@@ -349,13 +387,32 @@ class MainWindow(QMainWindow):
         self.rag_panel.db = workspace.db
         self.rag_panel.chunk_preview.db = workspace.db
         self.rag_panel.store = workspace.store
+        self.evaluation_panel.config = workspace_config
+        self.evaluation_panel.db = workspace.db
+        self.evaluation_panel.store = workspace.store
 
     def update_investigation_actions(self) -> None:
         has_selection = self.selected_workspace_id() is not None
+        is_busy = self._investigation_operation_is_busy()
         self.edit_button.setEnabled(has_selection)
         self.load_button.setEnabled(has_selection)
+        self.import_button.setEnabled(not is_busy)
+        self.export_button.setEnabled(has_selection and not is_busy)
+        self.rebuild_vectors_button.setEnabled(has_selection and not is_busy)
         if self.scan_panel.thread is None:
             self.scan_panel.scan_button.setEnabled(has_selection or self.active_workspace_id() is not None)
+
+    def _investigation_operation_is_busy(self) -> bool:
+        return any(
+            thread is not None
+            for thread in (
+                self.scan_panel.thread,
+                self.entities_panel.thread,
+                self.fact_ledger_panel.thread,
+                self.rag_panel.ask_thread,
+                self.evaluation_panel.run_thread,
+            )
+        )
 
     def refresh_loaded_investigation_marker(self) -> None:
         loaded_id = self.active_workspace_id()
@@ -466,8 +523,138 @@ class MainWindow(QMainWindow):
         if self.active_workspace_id() == workspace_id:
             self.set_active_investigation(workspace_id)
 
+    def export_investigation(self) -> None:
+        workspace_id = self.selected_workspace_id()
+        if workspace_id is None:
+            return
+        if self._investigation_operation_is_busy():
+            QMessageBox.warning(
+                self,
+                "Export investigation",
+                "Wait for the current scan, entity extraction, RAG request, or evaluation to finish.",
+            )
+            return
+        entry = self.catalog.get(workspace_id)
+        if entry is None:
+            QMessageBox.critical(self, "Export investigation", "Investigation workspace not found.")
+            return
+        suggested = str((Path.home() / f"{entry.name}{ARCHIVE_EXTENSION}").resolve())
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export investigation",
+            suggested,
+            f"Bosuil investigation (*{ARCHIVE_EXTENSION})",
+        )
+        if not destination:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = export_workspace(entry, Path(destination))
+        except Exception as exc:
+            QMessageBox.critical(self, "Export investigation", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(
+            self,
+            "Export investigation",
+            f"Portable investigation exported to:\n{result.path}\n\n"
+            "The vector index is reconstructed from SQLite when the archive is imported.",
+        )
+
+    def import_investigation(self) -> None:
+        if self._investigation_operation_is_busy():
+            QMessageBox.warning(
+                self,
+                "Import investigation",
+                "Wait for the current scan, entity extraction, RAG request, or evaluation to finish.",
+            )
+            return
+        archive_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import investigation",
+            "",
+            f"Bosuil investigation (*{ARCHIVE_EXTENSION})",
+        )
+        if not archive_name:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = import_workspace(
+                self.catalog,
+                Path(archive_name),
+                preferred_embedding_model=self.config.ollama_embed_model,
+            )
+            workspace_id = result.workspace.entry.id
+            self.reload_investigations(select_id=workspace_id)
+            self.set_active_investigation(workspace_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import investigation", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if result.vector_rebuild is not None:
+            vector_status = (
+                f"Restored {result.vector_rebuild.restored_vectors} of "
+                f"{result.vector_rebuild.active_chunks} active vectors."
+            )
+        elif result.vector_warning:
+            vector_status = (
+                "The investigation is available for keyword search, but its vector index "
+                f"could not be reconstructed:\n{result.vector_warning}"
+            )
+        else:
+            vector_status = "No vector reconstruction was required."
+        QMessageBox.information(
+            self,
+            "Import investigation",
+            f"Imported {result.workspace.entry.name!r}.\n\n{vector_status}",
+        )
+
+    def rebuild_investigation_vectors(self) -> None:
+        workspace_id = self.selected_workspace_id()
+        if workspace_id is None:
+            return
+        if self._investigation_operation_is_busy():
+            QMessageBox.warning(
+                self,
+                "Rebuild vectors",
+                "Wait for the current scan, entity extraction, RAG request, or evaluation to finish.",
+            )
+            return
+        entry = self.catalog.get(workspace_id)
+        if entry is None:
+            QMessageBox.critical(self, "Rebuild vectors", "Investigation workspace not found.")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            workspace = self.catalog.open(entry)
+            result = rebuild_workspace_vectors(
+                workspace,
+                preferred_embedding_model=self.config.ollama_embed_model,
+            )
+            if self.active_workspace_id() == workspace_id:
+                self.set_active_investigation(workspace_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Rebuild vectors", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        details = (
+            f"Restored {result.restored_vectors} of {result.active_chunks} active vectors "
+            f"using {result.embedding_model or 'the stored embedding metadata'}."
+        )
+        if result.backup_path is not None:
+            details += f"\n\nThe previous vector index was retained at:\n{result.backup_path}"
+        QMessageBox.information(self, "Rebuild vectors", details)
+
     def closeEvent(self, event) -> None:
         self.scan_panel.shutdown()
         self.files_panel.shutdown()
+        self.entities_panel.shutdown()
+        self.fact_ledger_panel.shutdown()
         self.rag_panel.shutdown()
+        self.evaluation_panel.shutdown()
         super().closeEvent(event)

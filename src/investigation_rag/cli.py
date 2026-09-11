@@ -11,6 +11,11 @@ from investigation_rag.embeddings.embedding_cache import EmbeddingCache
 from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.ingest.pipeline import ScanPipeline
 from investigation_rag.ingest.scan_mode import ScanMode
+from investigation_rag.portability import (
+    export_workspace,
+    import_workspace,
+    rebuild_workspace_vectors,
+)
 from investigation_rag.rag.ollama_llm import OllamaLLM
 from investigation_rag.rag.strict_answering import (
     ANSWER_STYLE_BOTH,
@@ -63,6 +68,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = sub.add_parser("list-investigations", help="List investigations.")
     list_parser.set_defaults(func=cmd_list)
+
+    export_parser = sub.add_parser(
+        "export-investigation", help="Export a portable investigation archive."
+    )
+    add_investigation_selector(export_parser)
+    export_parser.add_argument("--output", type=Path, required=True)
+    export_parser.set_defaults(func=cmd_export)
+
+    import_parser = sub.add_parser(
+        "import-investigation", help="Import a portable investigation archive."
+    )
+    import_parser.add_argument("archive", type=Path)
+    import_parser.add_argument(
+        "--no-rebuild-vectors",
+        action="store_true",
+        help="Import SQLite data without reconstructing LanceDB.",
+    )
+    import_parser.set_defaults(func=cmd_import)
+
+    rebuild_parser = sub.add_parser(
+        "rebuild-vector-index",
+        help="Reconstruct LanceDB from embeddings cached in SQLite.",
+    )
+    add_investigation_selector(rebuild_parser)
+    rebuild_parser.set_defaults(func=cmd_rebuild_vectors)
 
     scan = sub.add_parser("scan-investigation", help="Manually scan an investigation.")
     add_investigation_selector(scan)
@@ -141,6 +171,51 @@ def cmd_list(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCata
         workspace = catalog.open(entry)
         roots = ", ".join(str(root) for root in workspace.db.get_roots(workspace.investigation_id))
         print(f"{entry.id}\t{entry.name}\t{roots}")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    workspace = resolve_workspace(catalog, args)
+    result = export_workspace(workspace.entry, args.output)
+    print(f"Exported investigation {workspace.entry.id}: {result.path}")
+    print(f"SQLite snapshot: {result.database_bytes} bytes")
+    return 0
+
+
+def cmd_import(args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog) -> int:
+    result = import_workspace(
+        catalog,
+        args.archive,
+        preferred_embedding_model=config.ollama_embed_model,
+        rebuild_vectors=not args.no_rebuild_vectors,
+    )
+    print(f"Imported investigation {result.workspace.entry.id}: {result.workspace.entry.name}")
+    print(f"Workspace: {result.workspace.entry.workspace_path}")
+    if result.vector_rebuild is not None:
+        rebuilt = result.vector_rebuild
+        print(
+            f"Restored vectors: {rebuilt.restored_vectors}/{rebuilt.active_chunks} "
+            f"(model={rebuilt.embedding_model or 'none'})"
+        )
+    if result.vector_warning:
+        print(f"Vector warning: {result.vector_warning}", file=sys.stderr)
+    return 0
+
+
+def cmd_rebuild_vectors(
+    args: argparse.Namespace, config: AppConfig, catalog: WorkspaceCatalog
+) -> int:
+    workspace = resolve_workspace(catalog, args)
+    result = rebuild_workspace_vectors(
+        workspace,
+        preferred_embedding_model=config.ollama_embed_model,
+    )
+    print(
+        f"Restored vectors: {result.restored_vectors}/{result.active_chunks} "
+        f"(model={result.embedding_model or 'none'})"
+    )
+    if result.backup_path is not None:
+        print(f"Previous vector index: {result.backup_path}")
     return 0
 
 

@@ -66,6 +66,10 @@ class AppConfig:
     scan_hash_workers: int = 2
     scan_verbose_file_limit: int = 100
     chunk_max_tokens: int = 1400
+    entity_llm_model: str = "qwen3.6:latest"
+    entity_num_ctx: int = 131_072
+    entity_output_tokens: int = 8_192
+    fact_ledger_output_tokens: int = 16_384
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -110,6 +114,13 @@ class AppConfig:
             scan_hash_workers=_positive_int_env("SCAN_HASH_WORKERS", 2),
             scan_verbose_file_limit=_positive_int_env("SCAN_VERBOSE_FILE_LIMIT", 100),
             chunk_max_tokens=_positive_int_env("RAG_CHUNK_MAX_TOKENS", 1400),
+            entity_llm_model=os.getenv("ENTITY_LLM_MODEL", "qwen3.6:latest").strip()
+            or "qwen3.6:latest",
+            entity_num_ctx=_positive_int_env("ENTITY_NUM_CTX", 131_072),
+            entity_output_tokens=_positive_int_env("ENTITY_OUTPUT_TOKENS", 8_192),
+            fact_ledger_output_tokens=_positive_int_env(
+                "FACT_LEDGER_OUTPUT_TOKENS", 16_384
+            ),
         )
 
     def ensure_dirs(self) -> None:
