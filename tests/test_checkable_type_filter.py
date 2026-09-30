@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QTableWidgetItem
+from PyQt5.QtWidgets import QApplication, QComboBox, QTableWidgetItem
 
 from investigation_rag.gui.checkable_type_filter import CheckableTypeFilter
 from investigation_rag.gui.entities_panel import EntitiesPanel
@@ -104,5 +104,21 @@ def test_entities_panel_shows_rows_matching_any_selected_type():
 
     assert [panel.table.isRowHidden(row) for row in range(3)] == [False, True, False]
     assert panel.status_label.text() == "2 of 3 unique entities"
+    panel.shutdown()
+    app.processEvents()
+
+
+def test_entities_panel_uses_model_selector_and_document_progress():
+    app = application()
+    panel = EntitiesPanel(object())
+
+    assert isinstance(panel.model_combo, QComboBox)
+    assert panel.selected_entity_model()
+
+    panel.apply_extraction_progress(2, 5)
+
+    assert panel.progress_bar.maximum() == 5
+    assert panel.progress_bar.value() == 2
+    assert panel.progress_bar.format() == "2 out of 5 documents"
     panel.shutdown()
     app.processEvents()

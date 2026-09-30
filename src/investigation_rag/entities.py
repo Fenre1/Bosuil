@@ -151,8 +151,9 @@ def parse_entity_output(output: str, labels: Iterable[str]) -> list[ParsedEntity
             continue
         name = re.sub(r"\s+", " ", match.group(1)).strip()
         output_type = re.sub(r"\s+", " ", match.group(2)).strip().casefold()
-        entity_type = allowed.get(output_type)
-        if not name or entity_type is None:
+        # Requested labels guide the prompt; keep additional types in the results.
+        entity_type = allowed.get(output_type, TYPE_ALIASES.get(output_type, output_type))
+        if not name or not entity_type:
             rejected.append(raw_line.strip())
             continue
         key = (normalize_entity_name(name), entity_type)
@@ -449,6 +450,8 @@ def extract_entities(
     mentions: list[dict[str, Any]] = []
     total = len(documents)
     try:
+        if progress is not None:
+            progress(0, total)
         for index, document in enumerate(documents, start=1):
             if cancelled is not None and cancelled():
                 raise EntityExtractionCancelled("Entity extraction was stopped.")

@@ -185,7 +185,7 @@ class SearchPanel(QWidget):
         preview_splitter.setStretchFactor(0, 1)
         preview_splitter.setStretchFactor(1, 3)
 
-        splitter = QSplitter()
+        splitter = QSplitter(Qt.Vertical)
         results_panel = QWidget()
         results_layout = QVBoxLayout(results_panel)
         results_layout.setContentsMargins(0, 0, 0, 0)
@@ -196,6 +196,7 @@ class SearchPanel(QWidget):
         splitter.addWidget(preview_splitter)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
+        splitter.setSizes([360, 360])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 18)

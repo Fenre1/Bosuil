@@ -30,8 +30,6 @@ from investigation_rag.config import AppConfig
 from investigation_rag.db.sqlite_db import SQLiteDB
 from investigation_rag.embeddings.ollama_client import OllamaClient
 from investigation_rag.fact_ledger import (
-    FACT_BATCH_SIZE,
-    FACT_BATCH_OVERLAP,
     FactLedgerCancelled,
     FactLedgerFailure,
     FactLedgerItem,
@@ -151,9 +149,7 @@ class FactLedgerPanel(QWidget):
         self._document_count = 0
 
         intro = QLabel(
-            "Selecteer één document. De Uil extraheert alle verklaringen uit opeenvolgende sets "
-            f"van {FACT_BATCH_SIZE} chunks met {FACT_BATCH_OVERLAP} overlappende chunk en controleert "
-            "daarna het volledige feitenoverzicht op duplicaten en passende combinaties."
+            "Selecteer een document om feiten te verzamelen. Selecteer daarna een feit om de bron te bekijken."
         )
         intro.setWordWrap(True)
 
@@ -166,7 +162,7 @@ class FactLedgerPanel(QWidget):
         self.document_tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.document_tree.itemSelectionChanged.connect(self.selection_changed)
         self.document_tree.itemDoubleClicked.connect(self.document_double_clicked)
-        self.document_tree.setMinimumWidth(380)
+        self.document_tree.setMinimumWidth(280)
         self.document_status_label = QLabel("Geen onderzoek geladen")
         self.document_status_label.setObjectName("StatusLabel")
         self.model_edit = QLineEdit(config.ollama_llm_model or DEFAULT_ANSWER_MODEL)
@@ -197,9 +193,12 @@ class FactLedgerPanel(QWidget):
         controls.addWidget(QLabel("Model:"))
         controls.addWidget(self.model_edit)
         controls.addStretch(1)
-        controls.addWidget(self.start_button)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.export_button)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        actions.addWidget(self.export_button)
+        actions.addStretch(1)
         controls.addWidget(self.refresh_button)
 
         self.progress_bar = QProgressBar()
@@ -269,6 +268,7 @@ class FactLedgerPanel(QWidget):
         layout.setSpacing(10)
         layout.addWidget(intro)
         layout.addLayout(controls)
+        layout.addLayout(actions)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
         layout.addWidget(self.failure_label)

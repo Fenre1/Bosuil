@@ -99,6 +99,21 @@ def test_extracts_unique_entities_and_retains_document_mentions(tmp_path):
     ]
 
 
+def test_extraction_reports_document_total_before_first_generation(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+    progress = []
+
+    extract_entities(
+        db,
+        investigation_id,
+        ["person", "organization"],
+        generator=FakeEntityGenerator(),
+        progress=lambda done, total: progress.append((done, total)),
+    )
+
+    assert progress == [(0, 1), (1, 1)]
+
+
 def test_merge_survives_reextraction(tmp_path):
     db, investigation_id = make_database(tmp_path)
     extract_entities(db, investigation_id, ["person", "organization"], generator=FakeEntityGenerator())
@@ -400,6 +415,50 @@ def test_parses_simple_lines_aliases_and_deduplicates():
         ("burgemeester", "position"),
         ("Jan de Vries", "person"),
     ]
+
+
+def test_accepts_unrequested_types_and_normalizes_aliases_and_duplicates():
+    entities = parse_entity_output(
+        "Alice [Person]\nACME [Organisation]\nacme [organization]\n"
+        "Project Atlas [  Research   Project ]\nproject atlas [research project]",
+        ["person"],
+    )
+
+    assert entities == [
+        ParsedEntity("Alice", "person"),
+        ParsedEntity("ACME", "organization"),
+        ParsedEntity("Project Atlas", "research project"),
+    ]
+
+
+@pytest.mark.parametrize("output", ["Alice []", "Alice [   ]", "[Person]"])
+def test_rejects_empty_entity_names_or_types(output):
+    with pytest.raises(EntityOutputMalformed):
+        parse_entity_output(output, ["person"])
+
+
+def test_unrequested_types_are_saved_and_reused_from_cache(tmp_path):
+    db, investigation_id = make_database(tmp_path)
+
+    class AdditionalTypeGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, prompt):
+            self.calls += 1
+            return "Alice [Person]\nACME [Business]"
+
+    generator = AdditionalTypeGenerator()
+    for _ in range(2):
+        assert extract_entities(
+            db, investigation_id, ["person"], generator=generator
+        ) == 3
+        assert [
+            (row["name"], row["entity_type"], row["mention_count"])
+            for row in db.list_entities(investigation_id)
+        ] == [("ACME", "business", 1), ("Alice", "person", 2)]
+
+    assert generator.calls == 1
 
 
 def test_rejects_explanatory_model_output():

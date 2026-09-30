@@ -204,3 +204,19 @@ CREATE TABLE IF NOT EXISTS entity_extraction_cache (
   created_at TEXT NOT NULL,
   PRIMARY KEY(document_text_hash, extraction_signature)
 );
+
+CREATE TABLE IF NOT EXISTS entity_graph_views (
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(investigation_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS entity_graph_edits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  before_json TEXT NOT NULL,
+  after_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);

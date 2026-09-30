@@ -17,6 +17,9 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -132,20 +135,28 @@ class MainWindow(QMainWindow):
         self.rebuild_vectors_button.setObjectName("GhostButton")
         self.rebuild_vectors_button.clicked.connect(self.rebuild_investigation_vectors)
 
-        title = QLabel("Bosuil, de lokale antwoordvogel")
+        title = QLabel("Bosuil")
         title.setObjectName("AppTitle")
         self.header_investigation_label = QLabel("")
         self.header_investigation_label.setObjectName("HeaderInvestigationName")
+        self.header_investigation_label.setTextFormat(Qt.PlainText)
+        self.header_investigation_label.setWordWrap(True)
+        self.header_investigation_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         top = QHBoxLayout()
-        top.setContentsMargins(18, 14, 18, 16)
+        top.setContentsMargins(24, 18, 24, 18)
         top.setSpacing(10)
-        title_icon = self.build_title_icon()
-        if title_icon is not None:
-            top.addWidget(title_icon)
-        top.addWidget(title)
-        top.addWidget(self.header_investigation_label)
-        top.addStretch(1)
+        self.page_title = QLabel()
+        self.page_title.setObjectName("PageTitle")
+        self.page_description = QLabel()
+        self.page_description.setObjectName("PageDescription")
+        self.page_description.setWordWrap(True)
+        heading = QVBoxLayout()
+        heading.setSpacing(4)
+        heading.addWidget(self.page_title)
+        heading.addWidget(self.page_description)
+        top.addLayout(heading, 3)
+        top.addWidget(self.header_investigation_label, 1)
 
         header = QWidget()
         header.setObjectName("AppHeader")
@@ -170,26 +181,95 @@ class MainWindow(QMainWindow):
         self.search_panel = SearchPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
         self.rag_panel = RagPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
         self.evaluation_panel = EvaluationPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
-        self.tabs.addTab(self.scan_panel, "Onderzoeken")
-        self.tabs.addTab(self.filters_panel, "Filters")
-        self.tabs.addTab(self.files_panel, "Bestanden")
-        self.tabs.addTab(self.entities_panel, "Entiteiten")
-        self.tabs.addTab(self.fact_ledger_panel, "Feitenoverzicht")
-        self.tabs.addTab(self.search_panel, "Zoeken")
-        self.tabs.addTab(self.rag_panel, "De Uil Antwoord")
-        self.tabs.addTab(self.evaluation_panel, "Evaluatie")
+        self.pages = [
+            (self.scan_panel, "Onderzoeken", "Beheer je onderzoeken en indexeer bronbestanden."),
+            (self.filters_panel, "Filters", "Bepaal welke mappen en bestandstypen je doorzoekt."),
+            (self.files_panel, "Bestanden", "Verken documenten en bekijk de oorspronkelijke bronnen."),
+            (self.entities_panel, "Entiteiten", "Ontdek personen, organisaties en hun onderlinge verbanden."),
+            (self.fact_ledger_panel, "Feitenoverzicht", "Breng feiten uit een document samen met hun bronverwijzingen."),
+            (self.search_panel, "Zoeken", "Vind relevante passages in je onderzoek."),
+            (self.rag_panel, "De Uil Antwoord", "Stel vragen en volg elk antwoord terug naar de bron."),
+            (self.evaluation_panel, "Evaluatie", "Toets antwoorden aan een werkboek met referentievragen."),
+        ]
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("Navigation")
+        self.navigation.setAccessibleName("Hoofdnavigatie")
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        for panel, name, description in self.pages:
+            # Let the outer splitter shrink to the page, while nested splitters
+            # retain their minimum sizes so preview toolbars cannot be clipped.
+            for splitter in panel.findChildren(QSplitter):
+                ancestor = splitter.parentWidget()
+                while ancestor is not panel and not isinstance(ancestor, QSplitter):
+                    ancestor = ancestor.parentWidget()
+                if ancestor is panel:
+                    splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+                splitter.setChildrenCollapsible(False)
+            # Keep dense tools reachable on small screens without forcing the
+            # entire application beyond the available desktop size.
+            page = QScrollArea()
+            page.setObjectName("PageScroll")
+            page.setWidgetResizable(True)
+            page.setFrameShape(QScrollArea.NoFrame)
+            page.setWidget(panel)
+            self.tabs.addTab(page, name)
+            item = QListWidgetItem(name)
+            item.setToolTip(description)
+            self.navigation.addItem(item)
+        self.tabs.tabBar().hide()
+        self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex)
+        self.tabs.currentChanged.connect(self.update_page_heading)
+
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(212)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(14, 22, 14, 20)
+        sidebar_layout.setSpacing(12)
+        brand = QHBoxLayout()
+        title_icon = self.build_title_icon()
+        if title_icon is not None:
+            brand.addWidget(title_icon)
+        brand.addWidget(title)
+        brand.addStretch()
+        sidebar_layout.addLayout(brand)
+        tagline = QLabel("De lokale antwoordvogel")
+        tagline.setObjectName("SidebarCaption")
+        sidebar_layout.addWidget(tagline)
+        sidebar_layout.addSpacing(22)
+        section = QLabel("WERKRUIMTE")
+        section.setObjectName("SidebarCaption")
+        sidebar_layout.addWidget(section)
+        sidebar_layout.addWidget(self.navigation, 1)
+        footer = QLabel("Documenten. Verbanden. Antwoorden.")
+        footer.setObjectName("SidebarCaption")
+        footer.setWordWrap(True)
+        sidebar_layout.addWidget(footer)
 
         container = QWidget()
         container.setObjectName("AppRoot")
-        layout = QVBoxLayout(container)
+        layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(header)
-        layout.addWidget(self.tabs, 1)
+        layout.addWidget(sidebar)
+        content = QVBoxLayout()
+        content.setSpacing(0)
+        content.addWidget(header)
+        content.addWidget(self.tabs, 1)
+        layout.addLayout(content, 1)
         self.setCentralWidget(container)
+        self.navigation.setCurrentRow(0)
+        self.update_page_heading(0)
 
         self.reload_investigations()
         self.on_investigation_changed()
+
+    def update_page_heading(self, index: int) -> None:
+        if 0 <= index < len(self.pages):
+            _, title, description = self.pages[index]
+            self.page_title.setText(title)
+            self.page_description.setText(description)
+            self.navigation.setCurrentRow(index)
 
     def build_filters_panel(self) -> QWidget:
         self.file_type_scope_panel.layout().setContentsMargins(0, 0, 0, 0)
@@ -213,9 +293,9 @@ class MainWindow(QMainWindow):
         pixmap = crop_transparent_padding(pixmap)
         icon_label = QLabel()
         icon_label.setObjectName("AppIcon")
-        icon_label.setFixedSize(58, 58)
+        icon_label.setFixedSize(40, 48)
         icon_label.setAlignment(Qt.AlignCenter)
-        icon_label.setPixmap(pixmap.scaled(50, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        icon_label.setPixmap(pixmap.scaled(32, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         return icon_label
 
     def build_investigation_selector(self) -> QWidget:
@@ -224,6 +304,7 @@ class MainWindow(QMainWindow):
 
         self.loaded_investigation_label = QLabel("No investigation loaded")
         self.loaded_investigation_label.setObjectName("StatusLabel")
+        self.loaded_investigation_label.setWordWrap(True)
 
         selector = QWidget()
         selector.setObjectName("InvestigationPanel")
@@ -248,19 +329,32 @@ class MainWindow(QMainWindow):
         portability_row.setSpacing(8)
         portability_row.addWidget(self.import_button)
         portability_row.addWidget(self.export_button)
-        portability_row.addWidget(self.rebuild_vectors_button)
 
         scan_row = QHBoxLayout()
         scan_row.setSpacing(8)
-        scan_row.addWidget(self.scan_panel.scan_mode)
         scan_row.addWidget(self.scan_panel.scan_button)
         scan_row.addWidget(self.scan_panel.stop_button)
 
         selector_layout.addLayout(header_row)
+        self.investigation_empty_state = QLabel(
+            "Je eerste onderzoek\n\n"
+            "Maak een onderzoek aan en voeg een map met documenten toe. "
+            "Of importeer een bestaand .bosuil-bestand."
+        )
+        self.investigation_empty_state.setObjectName("EmptyState")
+        self.investigation_empty_state.setWordWrap(True)
+        self.investigation_empty_state.setAlignment(Qt.AlignCenter)
+        selector_layout.addWidget(self.investigation_empty_state, 1)
         selector_layout.addWidget(self.investigation_list, 1)
         selector_layout.addWidget(self.loaded_investigation_label)
         selector_layout.addLayout(action_row)
         selector_layout.addLayout(portability_row)
+        selector_layout.addWidget(self.rebuild_vectors_button, 0, Qt.AlignLeft)
+        scan_label = QLabel("Indexering")
+        scan_label.setObjectName("FieldLabel")
+        selector_layout.addSpacing(8)
+        selector_layout.addWidget(scan_label)
+        selector_layout.addWidget(self.scan_panel.scan_mode)
         selector_layout.addLayout(scan_row)
         return selector
 
@@ -294,6 +388,9 @@ class MainWindow(QMainWindow):
         else:
             self.investigation_list.setCurrentRow(-1)
         self.investigation_list.blockSignals(False)
+        has_investigations = self.investigation_list.count() > 0
+        self.investigation_empty_state.setVisible(not has_investigations)
+        self.investigation_list.setVisible(has_investigations)
         self.update_investigation_actions()
         self.refresh_loaded_investigation_marker()
         if loaded_id != self.active_workspace_id():
@@ -428,13 +525,15 @@ class MainWindow(QMainWindow):
             if is_loaded:
                 loaded_name = item.text()
         if loaded_name:
-            self.header_investigation_label.setText(f"Investigation: {loaded_name}")
+            self.header_investigation_label.setText(f"Actief onderzoek\n{loaded_name}")
+            self.header_investigation_label.setToolTip(loaded_name)
             if self._loading_workspace_id == loaded_id:
                 self.loaded_investigation_label.setText(f"Loading data for: {loaded_name}...")
             else:
                 self.loaded_investigation_label.setText(f"Loaded: {loaded_name}")
         else:
-            self.header_investigation_label.setText("")
+            self.header_investigation_label.setText("Geen onderzoek geladen")
+            self.header_investigation_label.setToolTip("")
             self.loaded_investigation_label.setText("No investigation loaded")
 
     def on_investigation_data_load_started(self, investigation_id: int) -> None:

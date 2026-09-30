@@ -64,6 +64,8 @@ investigation-rag-gui
 
 The GUI includes an investigation selector, create/edit dialog, root folder management, manual scan, scan log, keyword/semantic/hybrid search, result preview, Windows file/folder opening, contextual conversational strict RAG questions with PDF export, Excel-based end-to-end RAG evaluation, and disappeared-file review.
 
+Use the left sidebar to switch between the eight work areas. The page header shows the active investigation. Resizable panes and scrollable pages keep controls accessible in smaller windows; search results appear above the source preview so document columns have more room.
+
 The **Evaluatie** tab loads an `.xlsx` workbook containing `Question`, `Answer`, and `Points` columns, with optional `qID` and `Comment` columns. It runs every question independently through the currently loaded investigation and selected RAG settings, then uses the local `qwen3.6:latest` model to award points. The exported workbook preserves the input, adds the generated answer, judge score, and any evaluation error, and includes an `Evaluation Summary` worksheet with the run parameters and score totals.
 
 ## Performance diagnostics
@@ -196,21 +198,64 @@ text, model, prompt version, labels, and context settings. Multiple selected
 rows can still be merged under an editable canonical name and type; aliases
 are retained on later extraction runs.
 
-The **Graph** subtab visualizes the entities currently visible after applying
-the table filters. Entity rectangles contain the full entity name, use
-square-root scaling based on their number of distinct chunks, and are colored
-by entity type. Labels stay above links and chunk markers, then hide while
-their rectangle is hovered. Multiword organization names use two balanced
-lines, and words longer than 15 characters are split without truncation.
-Rectangles grow to the rendered label and are separated before display. A
-user-adjustable minimum font size reflows the drawing without rerunning the
-data or semantic layout. Semantic placement is
-calculated from the existing chunk embeddings with a deterministic UMAP-style
-local-neighborhood manifold projection. Selecting an entity
-reveals one link per shared chunk, regardless of repeated mentions inside that
-chunk. Hover a chunk marker for an excerpt or click it for the persistent full
-chunk preview. User-adjustable entity and chunk limits, plus explicit safety
-warnings for unusually dense memberships, keep large graphs manageable.
+The **Graph** subtab explores the complete active entity collection independently
+of the Results table's name, type, and mention filters. Find an entity or alias,
+select one or more Results rows and choose **Explore selected in graph**, or
+choose a document scope. A new entity exploration starts with its 20 highest
+ranked neighbours; **Expand all** adds every neighbour, and **Show all entities**
+draws every entity in the current scope. There is no entity, passage, membership,
+or edge cap in the explorer. Queries and layout run in a cancellable worker.
+
+Each edge represents one entity pair. **Same passage** connects entities with
+an exact mention in a shared active chunk; **Same document** also connects
+entities mentioned in separate passages of the same source document. Attachments
+are scoped separately when their source identity is available. Edges represent
+co-occurrence, not a verified relationship or causation. Counts always use the
+complete selected document scope, regardless of the nodes currently drawn.
+
+Click an entity for its aliases and complete sortable connection list. Click an
+edge or connection row for evidence grouped by source document, then select a
+passage to load its text. **Follow** explores the other endpoint and its
+neighbours. The two entities and their aliases are highlighted in
+different colours in **Readable text**; **Source** opens the existing source
+viewer with passage highlighting. Document-level evidence identifies which
+entity is present in each passage. Previous/Next navigates the evidence set;
+Earlier/Later stays within the source document.
+
+Rank neighbours by shared documents, shared passages, or specificity. Ranking
+counts discount exact file copies and identical passage text. Specificity is
+shared document contents divided by the union of document contents mentioning
+either entity (Jaccard similarity); it is not confidence or source independence.
+All source copies remain accessible in the evidence list. Near-duplicates are
+not detected, and entities mentioned only once remain available. The status
+separates collection size, document/type scope, and displayed nodes/edges. It
+also reports documents with entity mentions; extraction completeness is not
+inferred from the presence or absence of mentions.
+
+The default layout follows connections and keeps existing node positions during
+expansion. Drag nodes, pin them, hide them from the view, and use Back/Forward
+or **Exploration > Undo view change**. Selection preserves pan and zoom; **Fit
+view** is explicit. Ctrl-click nodes and choose **Shared connections** to explore
+their common neighbours. Labels appear as you zoom in; selected, pinned, and
+hovered nodes retain labels, with full names available in the inspector/tooltips.
+**Topic map** is a separate layout using stored entity-context embeddings;
+proximity there means similar text. No model generation or re-extraction is
+needed. Missing embeddings fall back to connection placement.
+
+**Collection overview** groups entities by connected component and displays
+representative names, with expandable type groups and individual entities.
+Double-click a group or entity to explore it. These automatic
+groups are navigation aids, not investigative findings. **Exploration > Save
+view / Load view** stores named explorations, including scope, pins, hidden
+nodes, selection, positions, layout, and viewport, in the investigation database.
+The selected evidence passage and preview mode are retained as well.
+Removed entities are omitted when restoring an old view.
+
+The inspector's **Entity actions** menu and node context menu provide type
+correction and alias merging. **Undo correction** restores the previous entity
+and mention records transactionally; it refuses to overwrite entity data that
+changed after the correction. Corrections retain aliases for subsequent
+extraction runs. View undo and correction undo are separate operations.
 
 The repository includes a curated required-entity reference set for the local
 138-page `test_pdf/onveiligheid-door-extreme-regen.pdf` test document. Save a

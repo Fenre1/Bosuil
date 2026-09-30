@@ -5,10 +5,12 @@ from threading import Event
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -32,6 +34,11 @@ from investigation_rag.entities import (
 from investigation_rag.gui.checkable_type_filter import CheckableTypeFilter
 from investigation_rag.gui.entity_graph import EntityGraphPanel
 from investigation_rag.gui.entity_merge_dialog import EntityMergeDialog
+from investigation_rag.gui.rag_panel import (
+    OllamaModelsWorker,
+    answer_model_is_usable,
+    answer_model_label,
+)
 
 
 class EntityExtractionWorker(QObject):
@@ -102,18 +109,24 @@ class EntitiesPanel(QWidget):
         self.investigation_id: int | None = None
         self.thread: QThread | None = None
         self.worker: EntityExtractionWorker | None = None
+        self.model_thread: QThread | None = None
+        self.model_worker: OllamaModelsWorker | None = None
 
         intro = QLabel(
-            "Extract unique named entities with one local Qwen request per document, then "
-            "link exact occurrences back to the indexed chunks."
+            "Extract entities from your documents, then explore their sources and connections."
         )
         intro.setWordWrap(True)
-        self.model_edit = QLineEdit(
-            config.entity_llm_model if config is not None else DEFAULT_ENTITY_MODEL
-        )
-        self.model_edit.setPlaceholderText(DEFAULT_ENTITY_MODEL)
-        self.model_edit.setFixedHeight(34)
-        self.model_edit.setMinimumWidth(180)
+        configured_model = config.entity_llm_model if config is not None else DEFAULT_ENTITY_MODEL
+        self.model_combo = QComboBox()
+        self.model_combo.addItem(configured_model, configured_model)
+        self.model_combo.setFixedHeight(34)
+        self.model_combo.setMinimumWidth(220)
+        self.refresh_models_button = QPushButton("Refresh models")
+        self.refresh_models_button.setObjectName("GhostButton")
+        self.refresh_models_button.setFixedHeight(34)
+        self.refresh_models_button.clicked.connect(self.refresh_entity_models)
+        self.model_status_label = QLabel("Loading Ollama models...")
+        self.model_status_label.setObjectName("StatusLabel")
         self.labels_edit = QLineEdit(", ".join(DEFAULT_ENTITY_LABELS))
         self.labels_edit.setPlaceholderText("person, organization, location")
         self.labels_edit.setFixedHeight(34)
@@ -131,18 +144,28 @@ class EntitiesPanel(QWidget):
             button.setFixedHeight(34)
         self.status_label = QLabel("No investigation loaded")
         self.status_label.setObjectName("StatusLabel")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0 out of 0 documents")
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.hide()
 
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(6)
         controls.addWidget(QLabel("Model:"))
-        controls.addWidget(self.model_edit)
+        controls.addWidget(self.model_combo)
+        controls.addWidget(self.refresh_models_button)
         controls.addWidget(QLabel("Entity types:"))
         controls.addWidget(self.labels_edit, 1)
-        controls.addWidget(self.extract_button)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.refresh_button)
-        controls.addWidget(self.merge_button)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        actions.addWidget(self.extract_button)
+        actions.addWidget(self.stop_button)
+        actions.addWidget(self.refresh_button)
+        actions.addWidget(self.merge_button)
+        actions.addStretch(1)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search entity names")
@@ -195,10 +218,20 @@ class EntitiesPanel(QWidget):
         results_layout = QVBoxLayout(results_page)
         results_layout.setContentsMargins(0, 8, 0, 0)
         results_layout.setSpacing(8)
+        results_layout.addWidget(intro)
+        results_layout.addLayout(controls)
+        results_layout.addWidget(self.model_status_label)
+        results_layout.addLayout(actions)
         results_layout.addWidget(self.status_label)
+        results_layout.addLayout(filters)
         results_layout.addWidget(self.table, 1)
 
+        self.explore_button = QPushButton("Explore selected in graph")
+        self.explore_button.clicked.connect(self.explore_selected)
+        results_layout.addWidget(self.explore_button)
+
         self.graph_panel = EntityGraphPanel(db, store)
+        self.graph_panel.entities_changed.connect(self.reload)
         self.result_tabs = QTabWidget()
         self.result_tabs.setDocumentMode(True)
         self.result_tabs.addTab(results_page, "Results")
@@ -206,13 +239,15 @@ class EntitiesPanel(QWidget):
         self.result_tabs.currentChanged.connect(self.result_tab_changed)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 12)
-        layout.setSpacing(6)
-        layout.addWidget(intro)
-        layout.addLayout(controls)
-        layout.addLayout(filters)
+        layout.setContentsMargins(18, 16, 18, 18)
+        layout.setSpacing(10)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.result_tabs, 1)
         self.update_actions()
+        if self.config is not None:
+            self.refresh_entity_models()
+        else:
+            self.model_status_label.clear()
 
     def set_investigation_id(self, investigation_id: int | None) -> None:
         changed = investigation_id != self.investigation_id
@@ -310,6 +345,12 @@ class EntitiesPanel(QWidget):
     def sync_graph_context(self) -> None:
         self.graph_panel.set_context(self.investigation_id, self.visible_entity_ids())
 
+    def explore_selected(self) -> None:
+        ids = self.selected_entity_ids()
+        if ids:
+            self.result_tabs.setCurrentWidget(self.graph_panel)
+            self.graph_panel.explore_entities(ids)
+
     def result_tab_changed(self, index: int) -> None:
         self.sync_graph_context()
         self.graph_panel.set_active(self.result_tabs.widget(index) is self.graph_panel)
@@ -327,7 +368,7 @@ class EntitiesPanel(QWidget):
         if not labels:
             QMessageBox.warning(self, "Entities", "Enter at least one entity type.")
             return
-        model_name = self.model_edit.text().strip()
+        model_name = self.selected_entity_model()
         if not model_name:
             QMessageBox.warning(self, "Entities", "Enter an installed Ollama model.")
             return
@@ -343,11 +384,7 @@ class EntitiesPanel(QWidget):
         self.worker = worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.progress.connect(
-            lambda done, total: self.status_label.setText(
-                f"Extracting entities: {done}/{total} documents"
-            )
-        )
+        worker.progress.connect(self.apply_extraction_progress)
         worker.message.connect(self.status_label.setText)
         worker.finished.connect(self.extraction_finished)
         worker.finished.connect(thread.quit)
@@ -356,9 +393,19 @@ class EntitiesPanel(QWidget):
         thread.finished.connect(thread.deleteLater)
         self.extract_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.model_edit.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self.refresh_models_button.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Preparing documents...")
+        self.progress_bar.show()
         self.status_label.setText(f"Connecting to Ollama model {model_name}...")
         thread.start()
+
+    def apply_extraction_progress(self, done: int, total: int) -> None:
+        maximum = max(1, total)
+        self.progress_bar.setRange(0, maximum)
+        self.progress_bar.setValue(min(done, maximum))
+        self.progress_bar.setFormat(f"{done} out of {total} documents")
 
     def extraction_finished(self, mention_count: int, error: str) -> None:
         if mention_count < 0:
@@ -384,7 +431,67 @@ class EntitiesPanel(QWidget):
     def thread_finished(self) -> None:
         self.thread = None
         self.worker = None
-        self.model_edit.setEnabled(True)
+        self.update_actions()
+
+    def selected_entity_model(self) -> str:
+        data = self.model_combo.currentData()
+        if data:
+            return str(data)
+        return self.model_combo.currentText().strip()
+
+    def refresh_entity_models(self) -> None:
+        if self.config is None or self.model_thread is not None:
+            return
+        self.model_status_label.setText("Loading Ollama models...")
+        self.refresh_models_button.setEnabled(False)
+        thread = QThread(self)
+        worker = OllamaModelsWorker(
+            self.config.ollama_base_url,
+            timeout=min(max(self.config.ollama_timeout_seconds, 1), 15),
+            allow_remote=self.config.ollama_allow_remote,
+        )
+        self.model_thread = thread
+        self.model_worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.apply_entity_models)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self.entity_model_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def apply_entity_models(self, models: list[dict[str, object]], status: str) -> None:
+        previous_model = self.selected_entity_model()
+        usable_models = [model for model in models if answer_model_is_usable(model)]
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model in sorted(
+            usable_models,
+            key=lambda item: str(item.get("name") or item.get("model") or "").casefold(),
+        ):
+            model_name = str(model.get("name") or model.get("model") or "").strip()
+            if model_name:
+                self.model_combo.addItem(answer_model_label(model), model_name)
+        if self.model_combo.count() == 0:
+            fallback_model = self.config.entity_llm_model if self.config is not None else DEFAULT_ENTITY_MODEL
+            self.model_combo.addItem(f"{fallback_model} (fallback)", fallback_model)
+        preferred_model = self.config.entity_llm_model if self.config is not None else previous_model
+        self.select_entity_model(preferred_model)
+        if self.selected_entity_model() != preferred_model:
+            self.select_entity_model(previous_model)
+        self.model_combo.blockSignals(False)
+        self.model_status_label.setText(status)
+
+    def select_entity_model(self, model_name: str) -> None:
+        for index in range(self.model_combo.count()):
+            if self.model_combo.itemData(index) == model_name:
+                self.model_combo.setCurrentIndex(index)
+                return
+
+    def entity_model_thread_finished(self) -> None:
+        self.model_thread = None
+        self.model_worker = None
         self.update_actions()
 
     def selected_entity_ids(self) -> list[int]:
@@ -428,10 +535,15 @@ class EntitiesPanel(QWidget):
         self.stop_button.setEnabled(running)
         self.refresh_button.setEnabled(available)
         self.merge_button.setEnabled(available and len(self.selected_entity_ids()) >= 2)
-        self.model_edit.setEnabled(available)
+        self.explore_button.setEnabled(available and bool(self.selected_entity_ids()))
+        self.model_combo.setEnabled(available)
+        self.refresh_models_button.setEnabled(not running and self.model_thread is None)
 
     def shutdown(self) -> None:
         self.graph_panel.shutdown()
+        if self.model_thread is not None and self.model_thread.isRunning():
+            self.model_thread.quit()
+            self.model_thread.wait(2000)
         if self.thread is not None:
             if self.worker is not None:
                 self.worker.cancel()

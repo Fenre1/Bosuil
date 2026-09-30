@@ -271,7 +271,6 @@ class EvaluationPanel(QWidget):
         settings_row.addWidget(self.answer_model_combo)
         settings_row.addWidget(self.refresh_models_button)
         settings_row.addStretch(1)
-        settings_row.addWidget(self.judge_label)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
@@ -286,6 +285,7 @@ class EvaluationPanel(QWidget):
         layout.setSpacing(12)
         layout.addLayout(file_row)
         layout.addLayout(settings_row)
+        layout.addWidget(self.judge_label)
         layout.addWidget(self.model_status_label)
         layout.addLayout(action_row)
         layout.addWidget(self.progress_bar)
