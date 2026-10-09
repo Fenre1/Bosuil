@@ -32,6 +32,7 @@ from investigation_rag.gui.file_type_scope import FileTypeScope, FileTypeScopePa
 from investigation_rag.gui.evaluation_panel import EvaluationPanel
 from investigation_rag.gui.entities_panel import EntitiesPanel
 from investigation_rag.gui.fact_ledger_panel import FactLedgerPanel
+from investigation_rag.gui.knowledge_graph_panel import KnowledgeGraphPanel
 from investigation_rag.gui.files_panel import FilesPanel
 from investigation_rag.gui.folder_scope import FolderScope, FolderScopePanel
 from investigation_rag.gui.investigation_dialog import InvestigationDialog
@@ -176,6 +177,7 @@ class MainWindow(QMainWindow):
         self.files_panel = FilesPanel(self.db, lazy_load_chunk_text=config.gui_lazy_load_file_chunk_text)
         self.entities_panel = EntitiesPanel(self.db, self.store, config)
         self.fact_ledger_panel = FactLedgerPanel(config, self.db)
+        self.knowledge_graph_panel = KnowledgeGraphPanel(config, self.db)
         self.files_panel.load_started.connect(self.on_investigation_data_load_started)
         self.files_panel.load_finished.connect(self.on_investigation_data_load_finished)
         self.search_panel = SearchPanel(config, self.db, self.store, self.folder_scope, self.file_type_scope)
@@ -187,6 +189,7 @@ class MainWindow(QMainWindow):
             (self.files_panel, "Bestanden", "Verken documenten en bekijk de oorspronkelijke bronnen."),
             (self.entities_panel, "Entiteiten", "Ontdek personen, organisaties en hun onderlinge verbanden."),
             (self.fact_ledger_panel, "Feitenoverzicht", "Breng feiten uit een document samen met hun bronverwijzingen."),
+            (self.knowledge_graph_panel, "Kennisgraaf", "Bouw brongebonden relaties met een onafhankelijk lokaal model en controleer het bewijs."),
             (self.search_panel, "Zoeken", "Vind relevante passages in je onderzoek."),
             (self.rag_panel, "De Uil Antwoord", "Stel vragen en volg elk antwoord terug naar de bron."),
             (self.evaluation_panel, "Evaluatie", "Toets antwoorden aan een werkboek met referentievragen."),
@@ -444,6 +447,7 @@ class MainWindow(QMainWindow):
             ("files panel kickoff", self.files_panel),
             ("entities panel", self.entities_panel),
             ("fact ledger panel", self.fact_ledger_panel),
+            ("knowledge graph panel", self.knowledge_graph_panel),
             ("search panel", self.search_panel),
             ("RAG panel", self.rag_panel),
             ("evaluation panel", self.evaluation_panel),
@@ -476,6 +480,7 @@ class MainWindow(QMainWindow):
         self.files_panel.preview.db = workspace.db
         self.entities_panel.set_data_sources(workspace.db, workspace.store)
         self.fact_ledger_panel.set_data_sources(workspace_config, workspace.db)
+        self.knowledge_graph_panel.set_data_sources(workspace_config, workspace.db)
         self.search_panel.config = workspace_config
         self.search_panel.db = workspace.db
         self.search_panel.preview.db = workspace.db
@@ -506,6 +511,7 @@ class MainWindow(QMainWindow):
                 self.scan_panel.thread,
                 self.entities_panel.thread,
                 self.fact_ledger_panel.thread,
+                self.knowledge_graph_panel.thread,
                 self.rag_panel.ask_thread,
                 self.evaluation_panel.run_thread,
             )
@@ -750,6 +756,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Rebuild vectors", details)
 
     def closeEvent(self, event) -> None:
+        if not self.knowledge_graph_panel.shutdown():
+            event.ignore()
+            return
         self.scan_panel.shutdown()
         self.files_panel.shutdown()
         self.entities_panel.shutdown()

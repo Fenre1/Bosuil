@@ -220,3 +220,125 @@ CREATE TABLE IF NOT EXISTS entity_graph_edits (
   after_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- Independent knowledge graph: never consumes entities or fact-ledger output.
+CREATE TABLE IF NOT EXISTS kg_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  settings_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  summary_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS kg_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  node_type TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- Exact names are resolved within one source, never automatically across documents.
+CREATE TABLE IF NOT EXISTS kg_aliases (
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  source_key TEXT NOT NULL,
+  normalized_name TEXT NOT NULL,
+  node_type TEXT NOT NULL,
+  node_id INTEGER NOT NULL REFERENCES kg_nodes(id) ON DELETE CASCADE,
+  PRIMARY KEY(investigation_id, source_key, normalized_name, node_type)
+);
+
+CREATE TABLE IF NOT EXISTS kg_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  claim_key TEXT NOT NULL,
+  subject_id INTEGER NOT NULL REFERENCES kg_nodes(id),
+  object_id INTEGER NOT NULL REFERENCES kg_nodes(id),
+  predicate TEXT NOT NULL,
+  polarity TEXT NOT NULL CHECK(polarity IN ('affirmed', 'negated', 'uncertain')),
+  attribution TEXT NOT NULL DEFAULT '',
+  time_text TEXT NOT NULL DEFAULT '',
+  chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  quote TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  verification TEXT NOT NULL,
+  review_status TEXT NOT NULL DEFAULT 'suggested' CHECK(review_status IN ('suggested', 'accepted', 'rejected')),
+  review_note TEXT NOT NULL DEFAULT '',
+  run_id INTEGER NOT NULL REFERENCES kg_runs(id),
+  created_at TEXT NOT NULL,
+  UNIQUE(investigation_id, claim_key)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_claims_scope ON kg_claims(investigation_id, chunk_id);
+CREATE INDEX IF NOT EXISTS idx_kg_claims_subject ON kg_claims(subject_id);
+CREATE INDEX IF NOT EXISTS idx_kg_claims_object ON kg_claims(object_id);
+
+CREATE TABLE IF NOT EXISTS kg_claim_attributes (
+  claim_id INTEGER PRIMARY KEY REFERENCES kg_claims(id) ON DELETE CASCADE,
+  attribute_name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kg_batches (
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  batch_key TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES kg_runs(id),
+  extraction_output TEXT NOT NULL,
+  verification_output TEXT NOT NULL,
+  diagnostics_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(investigation_id, batch_key)
+);
+
+-- Independently reusable extraction, verification and bounded recovery plans.
+CREATE TABLE IF NOT EXISTS kg_stage_cache (
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  stage TEXT NOT NULL CHECK(stage IN ('extraction', 'verification')),
+  cache_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(investigation_id, stage, cache_key)
+);
+
+-- Imported quotes stay portable even when their indexed sources are unavailable.
+-- They never create synthetic files/chunks or extraction cache entries.
+CREATE TABLE IF NOT EXISTS kg_import_nodes (
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  portable_key TEXT NOT NULL,
+  node_id INTEGER NOT NULL REFERENCES kg_nodes(id) ON DELETE CASCADE,
+  PRIMARY KEY(investigation_id, portable_key)
+);
+
+CREATE TABLE IF NOT EXISTS kg_imported_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  investigation_id INTEGER NOT NULL REFERENCES investigations(id) ON DELETE CASCADE,
+  portable_key TEXT NOT NULL,
+  claim_key TEXT NOT NULL,
+  subject_id INTEGER NOT NULL REFERENCES kg_nodes(id),
+  object_id INTEGER NOT NULL REFERENCES kg_nodes(id),
+  predicate TEXT NOT NULL,
+  polarity TEXT NOT NULL CHECK(polarity IN ('affirmed', 'negated', 'uncertain')),
+  attribution TEXT NOT NULL DEFAULT '',
+  time_text TEXT NOT NULL DEFAULT '',
+  attribute TEXT NOT NULL DEFAULT '',
+  chunk_id TEXT NOT NULL,
+  linked_chunk_id TEXT REFERENCES chunks(id) ON DELETE SET NULL,
+  native_claim_id INTEGER REFERENCES kg_claims(id) ON DELETE SET NULL,
+  path TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL DEFAULT 0,
+  page_number INTEGER,
+  attachment_name TEXT,
+  quote TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  exported_source_current INTEGER NOT NULL DEFAULT 0,
+  model TEXT NOT NULL DEFAULT '',
+  verification TEXT NOT NULL,
+  review_status TEXT NOT NULL CHECK(review_status IN ('suggested', 'accepted', 'rejected')),
+  review_note TEXT NOT NULL DEFAULT '',
+  original_run_id INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE(investigation_id, portable_key)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_imported_subject ON kg_imported_claims(subject_id);
+CREATE INDEX IF NOT EXISTS idx_kg_imported_object ON kg_imported_claims(object_id);

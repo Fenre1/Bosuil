@@ -64,7 +64,7 @@ investigation-rag-gui
 
 The GUI includes an investigation selector, create/edit dialog, root folder management, manual scan, scan log, keyword/semantic/hybrid search, result preview, Windows file/folder opening, contextual conversational strict RAG questions with PDF export, Excel-based end-to-end RAG evaluation, and disappeared-file review.
 
-Use the left sidebar to switch between the eight work areas. The page header shows the active investigation. Resizable panes and scrollable pages keep controls accessible in smaller windows; search results appear above the source preview so document columns have more room.
+Use the left sidebar to switch between the nine work areas. The page header shows the active investigation. Resizable panes and scrollable pages keep controls accessible in smaller windows; search results appear above the source preview so document columns have more room.
 
 The **Evaluatie** tab loads an `.xlsx` workbook containing `Question`, `Answer`, and `Points` columns, with optional `qID` and `Comment` columns. It runs every question independently through the currently loaded investigation and selected RAG settings, then uses the local `qwen3.6:latest` model to award points. The exported workbook preserves the input, adds the generated answer, judge score, and any evaluation error, and includes an `Evaluation Summary` worksheet with the run parameters and score totals.
 
@@ -182,6 +182,64 @@ Completed ledgers can be exported as `.xlsx`. The `Feitenoverzicht` worksheet
 contains the original document name, complete statements, source locations,
 and chunk IDs; the separate `Bron` worksheet records the document's full source
 path.
+
+# Knowledge graph
+
+The **Kennisgraaf** tab builds directed, source-backed relationships through a
+new independent pipeline. It reads indexed passages directly and does not use
+Feitenoverzicht or existing entity-extraction output. In **Documents**, select
+one or more files, choose your local model (or use **Refresh models**), then
+choose **Build graph**. Start with a small representative sample.
+
+English instructions, a compact relationship schema, exact source-quote checks,
+and an optional second verification call produce reviewable suggestions. The
+default verification pass is enabled. Negation, allegations, attribution and
+explicit time expressions remain attached to claims. Select an edge or a
+**Relationships** row to inspect its quote and source; accept/reject, correct
+claims/nodes, or explicitly merge identities. Equal names in different sources
+start as separate nodes. Rejected or stale source evidence is hidden by default.
+
+Relationship settings are grouped into **Time**, **Location**, **Facts and
+properties**, **Processes and effects**, and **People and organizations**.
+Dates/times, periods, durations, quantities with units/currencies, and states
+can appear as literal values. Property names distinguish facts such as a
+bridge's height and width even when their numeric values match. Explicitly
+described events and concepts need not have proper names. Temporal ordering
+and causation require explicit evidence. Existing saved default selections
+gain the broader vocabulary automatically; custom selections are preserved.
+
+**Extraction settings** controls the relationship types, context/output budgets,
+thinking mode and request duration. Defaults are an 8k context, 4,096 output
+tokens, thinking off and 180 seconds per call. Compact responses cite numbered
+source sentences; the app reconstructs exact quotes. Truncated or crowded
+windows automatically retry as smaller overlapping sections. Extraction and
+verification have separate caches: raising the token budget or retrying failed
+verification preserves completed work, including compatible older windows.
+**Stop** retains completed sections and cached extraction. During a stalled request,
+stopping waits for a stream update or the network timeout. **Diagnostics** shows
+model-loading, input-processing and generation timings, thinking-character
+counts and raw responses in **Build log → Diagnostics**. **Export graph** saves JSON; ordinary investigation
+archives include the graph database as well.
+
+The model defaults to your configured answer model. Historical Llama 3 8B paper
+results are a baseline, not a recommendation over current Qwen/Gemma models.
+Compare models on your own sources. **Nodes shown** lets you choose a display
+limit or **All** (the default); search/review filters still apply. **Connected
+groups** packs related nodes together, while **Compact grid** offers a uniform
+layout. **Rearrange** resets dragged positions; **Fit graph** fits the current
+view. Display preferences persist per investigation. The relationship table
+retains the complete filtered claim set regardless of the display limit.
+
+**Import graph** reads existing Bosuil knowledge graph JSON exports, including
+older v1 exports. It adds nodes, relationships, exact evidence quotes, properties
+and review information without calling a model. Reimporting preserves local
+corrections/reviews and avoids duplicates. Matching indexed passages are linked;
+otherwise claims remain visible as **imported quotes**, with source opening
+disabled. JSON exports contain quotes rather than full source documents. Reimport
+after indexing matching sources to attach their evidence. Imported graphs also
+travel with ordinary investigation archives.
+
+See [research basis, design choices and limitations](docs/knowledge-graph-design.md).
 
 # Entity extraction
 
